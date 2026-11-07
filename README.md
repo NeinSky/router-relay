@@ -254,10 +254,41 @@ conf.example.txt       config template — copy to conf.txt and fill in
 .gitattributes         LF for code/config, CRLF for PowerShell
 README.md              this document (English)
 README.ru.md           Russian translation — перевод на русский
+LICENSE                MIT
+.github/workflows/     CI: secret scan (gitleaks) + repository policy
+scripts/               check-repo-policy.sh — the policy checks, runnable locally
 ```
 
 Generated at runtime and intentionally **not** committed: `conf.txt`,
 `cline-router/`, `*.log`.
+
+## CI: no key ever leaves the machine
+
+`.github/workflows/secrets.yml` runs on every push and pull request, on manual
+dispatch, and once a week (a key committed months ago is still a leak, and the
+gitleaks rule set keeps improving). Two independent jobs:
+
+**`gitleaks`** — installs a pinned gitleaks binary and scans the **entire commit
+history** (`gitleaks git`, with `fetch-depth: 0`) plus the working tree
+(`gitleaks dir`). It always runs with `--redact`, because printing a detected
+secret into a CI log would turn a caught leak into a published one. The scan
+fails the build on any finding.
+
+**`policy`** — runs `scripts/check-repo-policy.sh`, which enforces the rules a
+generic scanner cannot know about:
+
+- `conf.txt`, `.env`, `cline-router/*`, `*.log`, `*.bak*` and `node_modules/*`
+  must not be tracked (catches a `git add -f` that bypassed `.gitignore`);
+- the `.gitignore` rules must still be live — checked behaviourally with
+  `git check-ignore`, so reformatting the file cannot quietly disable them;
+- no credential-shaped string (`sk-…`, `gh*_…`, `github_pat_…`, `AKIA…`,
+  `xox*-…`, PEM private keys) may appear in tracked files.
+
+The same script runs locally, so a leak is caught before it is pushed:
+
+```powershell
+bash scripts/check-repo-policy.sh
+```
 
 ## Security
 
@@ -279,7 +310,11 @@ Generated at runtime and intentionally **not** committed: `conf.txt`,
 
 ## License
 
-No license file is included. Add one before redistributing.
+MIT — see [LICENSE](LICENSE). You are free to use, modify, merge, publish,
+distribute and sell copies of this software; the only obligations are keeping
+the copyright notice and this permission notice in substantial copies, and the
+software is provided "as is", without warranty.
+
 
 
 

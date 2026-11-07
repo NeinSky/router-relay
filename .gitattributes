@@ -3,7 +3,10 @@
 # PowerShell launchers are used on Windows and keep their CRLF endings.
 *.ps1 text eol=crlf
 
-# The relay and the config templates are consumed by Node / parsed line by line.
+# The relay, the config templates and the CI shell script are consumed by
+# Node / bash / git on Linux runners and must stay LF.
 *.js  text eol=lf
+*.sh  text eol=lf
 *.txt text eol=lf
 *.md  text eol=lf
+*.yml text eol=lf
