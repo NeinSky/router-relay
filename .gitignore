@@ -1,0 +1,13 @@
+# --- Local secrets and machine-specific configuration -----------------------
+# conf.txt holds the real api_key. Only conf.example.txt belongs in the repo.
+conf.txt
+.env
+*.env
+
+# --- Isolated Cline profile created by Start-Cline.ps1 ----------------------
+# <script dir>\cline-router\data holds chat sessions, sqlite databases and
+# settings\providers.json (which contains the api key in plain text).
+cline-router/
+
+# --- Runtime output ---------------------------------------------------------
+*.log

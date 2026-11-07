@@ -1,0 +1,9 @@
+* text=auto
+
+# PowerShell launchers are used on Windows and keep their CRLF endings.
+*.ps1 text eol=crlf
+
+# The relay and the config templates are consumed by Node / parsed line by line.
+*.js  text eol=lf
+*.txt text eol=lf
+*.md  text eol=lf

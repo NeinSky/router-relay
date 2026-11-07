@@ -1,0 +1,7 @@
+base_url=https://your-router.example.com/v1
+base_url_reserved=https://your-router-backup.example.com/v1
+api_key=sk-REPLACE_ME
+model=your-model-id
+
+# Optional: route upstream requests through a local HTTP proxy. Empty = direct.
+proxy=
