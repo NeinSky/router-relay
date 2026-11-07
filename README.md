@@ -1,5 +1,7 @@
 # router-relay
 
+**English** | [Русский](README.ru.md)
+
 A local, dependency-free, OpenAI-compatible (`/v1`) relay that makes a router which
 cannot terminate an SSE stream usable from streaming clients such as the Cline CLI and
 the Hermes agent.
@@ -250,7 +252,8 @@ Start-Hermes.ps1       Hermes Agent CLI launcher
 conf.example.txt       config template — copy to conf.txt and fill in
 .gitignore             keeps conf.txt, the isolated profile and logs out of git
 .gitattributes         LF for code/config, CRLF for PowerShell
-README.md              this file
+README.md              this document (English)
+README.ru.md           Russian translation — перевод на русский
 ```
 
 Generated at runtime and intentionally **not** committed: `conf.txt`,
