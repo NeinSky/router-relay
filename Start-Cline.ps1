@@ -108,7 +108,7 @@
 param(
     [string]$Workspace,
 
-    [int]$RelayPort = 8765,
+    [int]$RelayPort = 0,
 
     [string]$ProfileDir,
 
@@ -495,26 +495,68 @@ function Confirm-ClineRelay {
     return (Start-ClineRelay -Port $Port)
 }
 
-function Stop-ClineRelay {
-    <# Kills relay processes started from this directory's router-relay.js on $Port. #>
-    param([Parameter(Mandatory = $true)][int]$Port)
+function Resolve-RelayPort {
+    <#
+        Resolves the relay port: explicit -RelayPort, then conf.txt `port`, then 8765.
+        conf.txt `port=0` means "any free port" - which a launcher cannot use, because it has to
+        know the address it hands to the client. A concrete free port is chosen instead, so several
+        relays can still coexist.
+    #>
+    param([int]$Requested)
 
-    $stopped = 0
-    $processes = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue
-    foreach ($process in $processes) {
-        if (-not $process.CommandLine) { continue }
-        if ($process.CommandLine -match 'router-relay\.js' -and $process.CommandLine -match "--port\s+$Port(\s|$)") {
-            Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
-            $stopped++
+    if ($Requested -gt 0) { return $Requested }
+
+    $resolved = 8765
+    if (Test-Path -LiteralPath $ConfPath) {
+        $conf = Read-ApiConf -Path $ConfPath
+        if ($conf.ContainsKey('port')) {
+            $parsed = 0
+            if ([int]::TryParse($conf['port'], [ref]$parsed) -and $parsed -ge 0 -and $parsed -le 65535) {
+                $resolved = $parsed
+            }
         }
     }
-    return $stopped
+
+    if ($resolved -eq 0) {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $listener.Start()
+        $resolved = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+        $listener.Stop()
+        Write-Host "conf.txt asks for port 0 (any free port); using $resolved for this run." -ForegroundColor DarkGray
+    }
+
+    return $resolved
 }
+
+function Stop-ClineRelay {
+    <#
+        Stops the relay on $Port through Stop-Relay.ps1. That script identifies a relay positively
+        (command line plus a /health pid match) and refuses to touch an unrelated process holding the
+        port. Keeping the identification in one place matters: a relay started without --port names
+        its port only in conf.txt, where a command-line match would never find it.
+    #>
+    param([Parameter(Mandatory = $true)][int]$Port)
+
+    $stopper = Join-Path -Path $PSScriptRoot -ChildPath 'Stop-Relay.ps1'
+    if (-not (Test-Path -LiteralPath $stopper)) {
+        throw "Stop-Relay.ps1 not found next to this script: $stopper"
+    }
+
+    & $stopper -Port $Port -Force
+    return ($LASTEXITCODE -eq 0)
+}
+
+# The relay port is central to everything below: the profile URL, the health check and the
+# stopper. Resolved once: -RelayPort, then conf.txt `port`, then 8765.
+$RelayPort = Resolve-RelayPort -Requested $RelayPort
 
 # -StopRelay is a standalone action: stop the background relay, leave Cline alone.
 if ($StopRelay) {
-    $stoppedCount = Stop-ClineRelay -Port $RelayPort
-    Write-Host "Stopped $stoppedCount local relay process(es) on port $RelayPort." -ForegroundColor Cyan
+    if (Stop-ClineRelay -Port $RelayPort) {
+        Write-Host "Relay on port $RelayPort is stopped." -ForegroundColor Cyan
+    } else {
+        Write-Host "Nothing was stopped on port $RelayPort (not a relay, or already gone)." -ForegroundColor Yellow
+    }
     return
 }
 

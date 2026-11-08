@@ -27,12 +27,22 @@
  *   "AttributeError: 'str' object has no attribute 'choices'".
  *
  * USAGE
- *   node router-relay.js [--port 8765] [--host URL] [--host-reserved URL] [--key KEY]
- *                        [--model ID] [--conf path] [--proxy URL] [--log FILE] [-v]
+ *   node router-relay.js [--port 8765] [--stream off|on|auto] [--host URL] [--host-reserved URL]
+ *                        [--key KEY] [--model ID] [--conf path] [--proxy URL] [--log FILE] [-v]
  *
  *   Defaults come from conf.txt next to this file (base_url - the main address - then
- *   base_url_reserved; api_key). Use --host to point the relay somewhere else.
+ *   base_url_reserved; api_key; port; stream). Use --host to point the relay somewhere else.
  *   The model is taken from the incoming request, so Cline may switch models freely.
+ *
+ *   PORT. --port wins over conf.txt `port`, which wins over 8765. A port of 0 lets the OS pick a
+ *   free one; the real number is printed at startup and reported by /health. This is what makes
+ *   several relays coexist on one machine.
+ *
+ *   STREAMING. `stream=off` (default) asks the upstream for a complete JSON answer and replays it
+ *   as a valid SSE stream - the original workaround for routers that never finish a stream.
+ *   `stream=on` passes the upstream SSE through untouched: lower latency and genuinely incre-
+ *   mental output, but only for an upstream that terminates its stream. `stream=auto` tries the
+ *   passthrough and falls back to replay when the stream turns out to be broken.
  *
  * ENDPOINTS
  *   POST /v1/chat/completions   translated to the upstream router
@@ -62,8 +72,19 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { Readable } = require('node:stream');
 
 const DEFAULT_PORT = 8765;
+// "off" keeps the original behaviour: a complete JSON answer is fetched and replayed as SSE. It is
+// the only mode that works with an upstream which never terminates its stream, so it stays the
+// default. "on" trusts the upstream to finish properly (finish_reason + [DONE]) and simply relays
+// its bytes; "auto" probes passthrough and degrades per route.
+const STREAM_MODES = ['off', 'on', 'auto'];
+const DEFAULT_STREAM_MODE = 'off';
+// How much of the tail of a passthrough stream is inspected for the `[DONE]` sentinel. A few KB is
+// plenty - the sentinel is always the last event - and it keeps the detector from buffering a whole
+// (possibly huge) answer just to answer "did this stream terminate?".
+const PASSTHROUGH_TAIL_CHARS = 2048;
 const REQUEST_TIMEOUT_MS = 600000; // 10 min per attempt: reasoning models can think for a long time
 // Failover budget: each route in the list is tried once per pass, and a second pass re-walks the
 // whole list because the upstream router also flakes on its own, independently of which route we
@@ -79,10 +100,13 @@ const ROUTE_COOLDOWN_MS = 60000;
 const ROUTE_COOLDOWN_MAX_MS = 900000;
 
 function parseArgs(argv) {
-	const opts = { port: DEFAULT_PORT, verbose: false };
+	// port and stream stay null until the config file has been consulted, otherwise an explicit
+	// `--port 8765` would be indistinguishable from the built-in default.
+	const opts = { port: null, stream: null, verbose: false };
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
-		if (a === '--port' || a === '-p') opts.port = Number(argv[++i]);
+		if (a === '--port' || a === '-p') opts.port = argv[++i];
+		else if (a === '--stream' || a === '-s') opts.stream = argv[++i];
 		else if (a === '--host' || a === '-b') opts.host = argv[++i];
 		else if (a === '--host-reserved' || a === '-B') opts.hostReserved = argv[++i];
 		else if (a === '--key' || a === '-k') opts.key = argv[++i];
@@ -142,6 +166,35 @@ function readConf(confPath) {
 		values[entry.slice(0, sep).trim()] = entry.slice(sep + 1).trim();
 	}
 	return values;
+}
+
+// Port precedence: --port, then conf.txt `port`, then 8765. 0 is valid and means "let the OS pick"
+// - that is how several relays live side by side without a fixed numbering plan. A value that is
+// not a port is a configuration mistake, so it exits with the same code as a missing host/key (2)
+// rather than being silently coerced into the busy-port path (3).
+function resolvePort(cliPort, confPort) {
+	const raw = cliPort !== null && cliPort !== undefined ? cliPort : confPort;
+	if (raw === undefined || raw === null || raw === '') return DEFAULT_PORT;
+	const port = Number(raw);
+	if (!Number.isInteger(port) || port < 0 || port > 65535) {
+		console.error('router-relay: invalid port "' + raw + '" (expected 0-65535, 0 = pick a free one)');
+		process.exit(2);
+	}
+	return port;
+}
+
+// Streaming precedence is the same as for the port. An unknown value is a configuration mistake:
+// silently falling back to the default would hide a typo that changes the behaviour of every
+// single request.
+function resolveStreamMode(cliMode, confMode) {
+	const raw = cliMode !== null && cliMode !== undefined ? cliMode : confMode;
+	if (raw === undefined || raw === null || raw === '') return DEFAULT_STREAM_MODE;
+	const mode = String(raw).trim().toLowerCase();
+	if (!STREAM_MODES.includes(mode)) {
+		console.error('router-relay: invalid stream mode "' + raw + '" (expected one of: ' + STREAM_MODES.join(', ') + ')');
+		process.exit(2);
+	}
+	return mode;
 }
 
 function sendJson(res, status, obj) {
@@ -233,7 +286,8 @@ function isRetryableStatus(status) {
 }
 
 // One transport attempt on one route. An empty proxy means Node's own fetch, which genuinely goes
-// direct (undici ignores HTTP_PROXY/HTTPS_PROXY); otherwise curl performs the tunnel.
+// direct (undici ignores HTTP_PROXY/HTTPS_PROXY); otherwise curl performs the tunnel. A streaming
+// request accepts that only fetch can pass the bytes through - see requestStreamOnce.
 async function requestOnce(opts, route, pathname, options) {
 	const url = route.host.replace(/\/+$/, '') + pathname;
 	if (route.proxy) {
@@ -260,6 +314,42 @@ async function requestOnce(opts, route, pathname, options) {
 		status: response.status,
 		contentType: response.headers.get('content-type') || 'application/json',
 		text,
+	};
+}
+
+// Streaming counterpart of requestOnce. It exists as a separate function because the two differ in
+// the one way that matters: a buffered attempt has no usable answer until the body has been read to
+// the end, while a streaming attempt is decided at the response headers. fetch resolves on the
+// headers, so a 4xx/5xx or a failed connection is still seen - and retried - before a single byte
+// reaches the client. Only after the headers are known to be good does the relay commit to a route.
+//
+// Passthrough is fetch-only on purpose. The proxy transport is curl, and curl reports the status
+// code via -w at the *end* of the transfer; there is no point at which its headers can be handed to
+// the client before the answer exists. Saying so out loud beats a silently buffered "stream".
+function canStreamThrough(route) {
+	return !route.proxy;
+}
+
+async function requestStreamOnce(opts, route, pathname, options) {
+	if (!canStreamThrough(route)) {
+		const err = new Error('streaming passthrough is not available through the proxy transport (' + route.proxy + '); use stream=off for this route');
+		err.streamUnsupported = true;
+		throw err;
+	}
+
+	const url = route.host.replace(/\/+$/, '') + pathname;
+	const response = await fetch(url, {
+		method: options.method || 'POST',
+		headers: { ...options.headers, accept: 'text/event-stream' },
+		body: options.body,
+		signal: AbortSignal.timeout(options.timeoutMs || REQUEST_TIMEOUT_MS),
+	});
+
+	return {
+		ok: response.ok,
+		status: response.status,
+		contentType: response.headers.get('content-type') || 'text/event-stream',
+		body: response.body,
 	};
 }
 
@@ -336,6 +426,62 @@ async function requestUpstream(opts, pathname, options) {
 	if (lastResponse) return lastResponse;
 	throw lastErr || new Error('relay: every route failed');
 }
+// Streaming sibling of requestUpstream. Same route walk, same cooldown bookkeeping, same failover
+// triggers - the single difference is that a successful attempt returns an open byte stream instead
+// of a body that has already been read. Nothing is written to the client here: the caller owns the
+// response, so a later failure can still be answered with a clean JSON error.
+async function requestUpstreamStream(opts, pathname, options) {
+	let routes = routeOrder(opts);
+	// In auto mode a route that was already caught dropping the stream is skipped for passthrough;
+	// if that leaves nothing, the request simply falls back to the replay path.
+	if (opts.streamMode === 'auto' && opts.passthroughBroken && opts.passthroughBroken.size > 0) {
+		const usable = routes.filter((route) => !opts.passthroughBroken.has(describeRoute(route)));
+		if (usable.length === 0) {
+			const err = new Error('every route is known to drop streams; use stream=off');
+			err.streamUnsupported = true;
+			throw err;
+		}
+		routes = usable;
+	}
+	let lastErr = null;
+	let lastResponse = null;
+
+	for (let pass = 0; pass < ROUTE_PASSES; pass++) {
+		for (const route of routes) {
+			let result;
+			try {
+				result = await requestStreamOnce(opts, route, pathname, options);
+			} catch (err) {
+				lastErr = err;
+				// A route that simply cannot do passthrough is not sick, so it must not be punished
+				// with a cooldown - that would only make the fallback slower on every request.
+				if (err && err.streamUnsupported) {
+					log(opts, 'route skipped for streaming:', describeRoute(route), '-', err.message);
+					continue;
+				}
+				const cool = coolDownRoute(opts, route);
+				log(opts, 'stream route failed (pass ' + (pass + 1) + '/' + ROUTE_PASSES + '), cooling ' + Math.round(cool.wait / 1000) + 's (strike ' + opts.routeCooldown.get(cool.key).strikes + '):', cool.key, '-', err && err.message ? err.message : String(err));
+				continue;
+			}
+			result.route = describeRoute(route);
+
+			if (isRetryableStatus(result.status)) {
+				lastResponse = result;
+				const cool = coolDownRoute(opts, route);
+				log(opts, 'stream route gave retryable status (pass ' + (pass + 1) + '/' + ROUTE_PASSES + '), cooling ' + Math.round(cool.wait / 1000) + 's (strike ' + opts.routeCooldown.get(cool.key).strikes + '):', cool.key, '-', result.status);
+				continue;
+			}
+			clearCooldown(opts, route);
+			if (pass > 0 || route !== routes[0]) {
+				log(opts, 'stream route recovered:', describeRoute(route), '-', result.status);
+			}
+			return result;
+		}
+	}
+
+	if (lastResponse) return lastResponse;
+	throw lastErr || new Error('relay: every route failed');
+}
 
 // Sends a JSON error response if that is still possible, otherwise closes whatever is open.
 function failSafely(opts, res, status, obj) {
@@ -380,7 +526,6 @@ function run(opts, res, promise) {
 		failSafely(opts, res, 502, { error: { message: 'relay: ' + message, type: 'api_error' } });
 	});
 }
-
 
 function writeChunk(opts, res, text) {
 	if (res.writableEnded || res.destroyed) return;
@@ -469,6 +614,79 @@ function replayAsStream(opts, res, upstream, model) {
 		res.end();
 	}
 }
+// Copies an upstream SSE stream to the client as it arrives. The client gets exactly what the
+// upstream sent - no re-serialisation, no chunk sizing games - which is only safe when the upstream
+// terminates its stream properly. That is what the `stream` setting is for: `off` never takes this
+// path, `on` always trusts it, `auto` watches it and reports whether it ended cleanly.
+//
+// The promise resolves with { terminated } instead of throwing, because by the time the first byte
+// is out the client already has a 200 and headers; there is nothing left to fail over to. The
+// caller decides what a broken stream means.
+function pipeStreamToClient(opts, res, upstream, model) {
+	return new Promise((resolve) => {
+		const chunks = [];
+		let tail = '';
+		let terminated = false;
+		let bytes = 0;
+
+		res.writeHead(200, {
+			'content-type': 'text/event-stream',
+			'cache-control': 'no-cache, no-transform',
+			connection: 'keep-alive',
+			'x-accel-buffering': 'no',
+		});
+		if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+		const source = Readable.fromWeb(upstream.body);
+
+		source.on('data', (chunk) => {
+			const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			bytes += buf.length;
+			chunks.push(buf);
+			// Only the tail is decoded: `[DONE]` is always the last event, and decoding the whole
+			// answer just to look for it would defeat the point of streaming.
+			tail = (tail + buf.toString('utf8')).slice(-PASSTHROUGH_TAIL_CHARS);
+			if (res.writableEnded || res.destroyed) return;
+			try {
+				res.write(buf);
+			} catch (err) {
+				log(opts, 'write to client failed:', err && err.message ? err.message : String(err));
+			}
+		});
+
+		source.on('error', (err) => {
+			log(opts, 'stream source error:', err && err.message ? err.message : String(err));
+			if (!res.writableEnded && !res.destroyed) {
+				try {
+					res.end();
+				} catch {
+					/* the client is gone */
+				}
+			}
+			resolve({ terminated: false, bytes });
+		});
+
+		source.on('end', () => {
+			terminated = tail.includes('[DONE]');
+			const body = Buffer.concat(chunks).toString('utf8');
+			const finish = /"finish_reason"\s*:\s*"([^"]+)"/.exec(body);
+			log(opts, 'upstream stream done', {
+				bytes,
+				terminated,
+				finish: finish ? finish[1] : null,
+				model,
+			});
+			if (!res.writableEnded && !res.destroyed) {
+				try {
+					res.end();
+				} catch (err) {
+					log(opts, 'failed to close stream:', err && err.message ? err.message : String(err));
+				}
+			}
+			resolve({ terminated, bytes });
+		});
+	});
+}
 
 // Answers a client that asked for a non-streaming completion with a plain JSON body. The upstream
 // is always called with "stream": false, so its parsed body is already a complete chat.completion
@@ -522,6 +740,10 @@ async function handleChat(opts, req, res) {
 		const model = payload.model;
 		const bodyText = JSON.stringify(payload);
 		const started = Date.now();
+		// Passthrough is only offered to a client that explicitly asked for SSE: a non-streaming
+		// client (Hermes auxiliary calls, title generation) parses one JSON object and breaks on a
+		// stream, no matter what the upstream is capable of.
+		const wantPassthrough = clientWantsStream && opts.streamMode !== 'off';
 		// Bytes and reasoning params are logged because both matter in practice: the router drops large
 		// prompts, and this is the only way to see which reasoning effort Cline really sends.
 		log(opts, 'upstream request', {
@@ -531,8 +753,61 @@ async function handleChat(opts, req, res) {
 			bytes: bodyText.length,
 			client_stream: clientStreamFlag === undefined ? 'absent' : clientStreamFlag,
 			reply: clientWantsStream ? 'sse' : 'json',
+			transport: wantPassthrough ? 'passthrough' : 'replay',
 			reasoning: payload.reasoning_effort !== undefined ? payload.reasoning_effort : (payload.reasoning !== undefined ? payload.reasoning : null),
 		});
+
+		if (wantPassthrough) {
+			const streamPayload = JSON.stringify({ ...payload, stream: true });
+			let streamed = null;
+			let streamError = null;
+			try {
+				streamed = await requestUpstreamStream(opts, '/chat/completions', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json', authorization: 'Bearer ' + opts.key },
+					body: streamPayload,
+				});
+			} catch (err) {
+				streamError = err;
+			}
+
+			// Passthrough could not even start: the proxy transport cannot do it, or every route is
+			// known to be broken. Nothing has been written to the client yet, so falling back to the
+			// replay path is free and turns a hard failure into a slower but correct answer.
+			if (streamError && streamError.streamUnsupported) {
+				log(opts, 'passthrough unavailable, falling back to replay:', streamError.message);
+				opts.streamMode = 'off';
+			} else if (streamError) {
+				const message = streamError && streamError.message ? streamError.message : String(streamError);
+				log(opts, 'stream upstream failed:', message);
+				failSafely(opts, res, 502, { error: { message: 'relay: ' + message, type: 'api_error' } });
+				return;
+			} else {
+				if (!streamed.ok) {
+					// Headers are known and bad: nothing has been sent to the client yet, so a clean error
+					// still works and the failover budget has already been spent on this status.
+					let text = '';
+					try {
+						text = await new Response(streamed.body).text();
+					} catch {
+						/* the body may already be gone; the status is what matters */
+					}
+					log(opts, 'stream upstream status', streamed.status);
+					mirrorSafely(opts, res, streamed.status, streamed.contentType, text);
+					return;
+				}
+
+				const result = await pipeStreamToClient(opts, res, streamed, model);
+				if (opts.streamMode === 'auto' && !result.terminated) {
+					// Remember the verdict per route so the next request does not pay for the same
+					// discovery: this upstream does not terminate streams, buffer it from now on.
+					opts.passthroughBroken = opts.passthroughBroken || new Set();
+					opts.passthroughBroken.add(streamed.route);
+					log(opts, 'passthrough did not terminate - buffering this route from now on:', streamed.route);
+				}
+				return;
+			}
+		}
 
 		let upstream;
 		try {
@@ -613,11 +888,18 @@ function main() {
 	opts.hostReserved = opts.hostReserved || conf.base_url_reserved || '';
 	opts.key = opts.key || conf.api_key || '';
 	opts.proxy = opts.proxy || conf.proxy || '';
+	opts.port = resolvePort(opts.port, conf.port);
+	opts.streamMode = resolveStreamMode(opts.stream, conf.stream);
 	if (!opts.host || !opts.key) {
 		console.error('router-relay: need an upstream host and api key (conf.txt or --host/--key)');
 		process.exit(2);
 	}
 	opts.routes = buildRoutes(opts);
+	// Passthrough is fetch-only, so it cannot work for a proxy-only route set. Say it once at
+	// startup instead of leaving the operator to wonder why "stream=on" still looks buffered.
+	if (opts.streamMode !== 'off' && opts.routes.every((route) => !canStreamThrough(route))) {
+		announce('router-relay: stream=' + opts.streamMode + ' but every route uses the proxy transport - streaming will fall back to replay');
+	}
 
 	// An unhandled rejection kills Node (>=15), which is exactly how this relay used to die in the
 	// middle of an answer and make Cline report ECONNRESET. Log and stay alive instead: all state
@@ -638,7 +920,7 @@ function main() {
 		try {
 			if (req.method === 'POST' && url === '/v1/chat/completions') return run(opts, res, handleChat(opts, req, res));
 			if (req.method === 'GET' && url === '/v1/models') return run(opts, res, handleModels(opts, res));
-			if (req.method === 'GET' && (url === '/health' || url === '/')) return sendJson(res, 200, { ok: true, upstream: opts.host, upstream_reserved: opts.hostReserved || null, proxy: opts.proxy || null, routes: opts.routes.map(describeRoute), cooling: opts.routeCooldown ? Array.from(opts.routeCooldown.entries()).map(([route, e]) => ({ route, strikes: e.strikes, until: new Date(e.until).toISOString() })) : [], pid: process.pid });
+			if (req.method === 'GET' && (url === '/health' || url === '/')) return sendJson(res, 200, { ok: true, port: opts.port, stream: opts.streamMode, upstream: opts.host, upstream_reserved: opts.hostReserved || null, proxy: opts.proxy || null, routes: opts.routes.map(describeRoute), cooling: opts.routeCooldown ? Array.from(opts.routeCooldown.entries()).map(([route, e]) => ({ route, strikes: e.strikes, until: new Date(e.until).toISOString() })) : [], pid: process.pid });
 			return failSafely(opts, res, 404, { error: { message: 'relay: unknown route ' + req.method + ' ' + url, type: 'invalid_request_error' } });
 		} catch (err) {
 			log(opts, 'routing failed:', err && err.message ? err.message : String(err));
@@ -663,7 +945,14 @@ function main() {
 	server.headersTimeout = 125000;
 
 	server.listen(opts.port, '127.0.0.1', () => {
-		announce('router-relay listening on http://127.0.0.1:' + opts.port + '/v1  ->  ' + opts.routes.map(describeRoute).join('  ||  ') + ' (pid ' + process.pid + ', failover order: ' + opts.routes.length + ' routes x ' + ROUTE_PASSES + ' passes; streaming clients get SSE, non-streaming clients get JSON)');
+		// With port=0 the OS picks the port, so the requested value is meaningless from here on:
+		// adopt the real one so /health, the startup banner and the stopper all agree.
+		const address = server.address();
+		if (address && typeof address === 'object' && address.port) {
+			if (opts.port !== address.port) log(opts, 'port 0 requested, OS assigned', address.port);
+			opts.port = address.port;
+		}
+		announce('router-relay listening on http://127.0.0.1:' + opts.port + '/v1  ->  ' + opts.routes.map(describeRoute).join('  ||  ') + ' (pid ' + process.pid + ', stream=' + opts.streamMode + ', failover order: ' + opts.routes.length + ' routes x ' + ROUTE_PASSES + ' passes; streaming clients get SSE, non-streaming clients get JSON)');
 	});
 }
 

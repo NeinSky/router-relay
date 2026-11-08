@@ -68,6 +68,9 @@ node router-relay.js --port 8765
 
 # 3. Verify it is alive (reports the failover routes and any cooling route).
 curl http://127.0.0.1:8765/health
+
+# 4. Stop it again.
+.\Stop-Relay.ps1 -Port 8765
 ```
 
 Then point any OpenAI-compatible client at `http://127.0.0.1:8765/v1` with any
@@ -94,9 +97,32 @@ Blank lines and lines starting with `#` or `;` are ignored.
 | `api_key` | Bearer token sent upstream. |
 | `model` | Read by `Start-Cline.ps1` to build the isolated profile. The relay itself takes the model from the request unless `--model` is passed. |
 | `proxy` | Optional local HTTP proxy (e.g. `http://127.0.0.1:10809`). Empty = direct. |
+| `port` | TCP port on `127.0.0.1`. Empty or absent = `8765`. `0` lets the OS pick a free port (printed at startup and reported by `/health`); any other number runs several relays side by side. **`--port` overrides this.** |
+| `stream` | `off` (default), `on` or `auto` — see [Streaming](#streaming). **`--stream` overrides this.** |
 
 > **`conf.txt` is git-ignored.** Only `conf.example.txt` is committed. See
 > [Security](#security).
+
+### Streaming
+
+The relay can either **replay** a finished answer as SSE or **pass the upstream stream through**.
+Which one is right depends on the upstream, so it is a setting rather than a guess:
+
+| `stream=` | Behaviour | Use when |
+|---|---|---|
+| `off` | Asks the upstream for `"stream": false`, reads the complete JSON answer, then replays it as a valid SSE stream (role delta, content deltas, tool-call deltas, `finish_reason`, `[DONE]`). | **Default.** The upstream never terminates its stream — the case this relay was written for. |
+| `on` | Passes the upstream SSE bytes through untouched: real incremental output, lower latency, no re-serialisation. | The upstream terminates properly (`finish_reason` + `[DONE]`). Selectel AI Gateway does. |
+| `auto` | Tries the passthrough; if a route's stream ends without `[DONE]`, that route is remembered and buffered from then on. | An upstream whose behaviour you are unsure of. |
+
+Two invariants hold in every mode:
+
+- A client that does **not** set `"stream": true` always gets one JSON object, never SSE. Hermes's
+  auxiliary calls (approvals, titles, compression) depend on this.
+- Passthrough needs `fetch`, so it is only available on direct routes. A route that goes through
+  the proxy (curl) is buffered regardless of `stream=`, and the relay says so at startup.
+
+Failover is identical in both modes: a bad status or a failed connection is retried on the next
+route *before* anything reaches the client, because `fetch` resolves on the response headers.
 
 ## Endpoints
 
@@ -104,7 +130,7 @@ Blank lines and lines starting with `#` or `;` are ignored.
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Translated to the upstream router; SSE or JSON as described above. |
 | `GET` | `/v1/models` | Passed through to the upstream router (30 s timeout). |
-| `GET` | `/health`, `/` | Local liveness check. Returns `ok`, `upstream`, `upstream_reserved`, `proxy`, `routes`, `cooling` and `pid`. |
+| `GET` | `/health`, `/` | Local liveness check. Returns `ok`, `port`, `stream`, `upstream`, `upstream_reserved`, `proxy`, `routes`, `cooling` and `pid`. |
 
 `/health` is what the launchers poll before starting a client, so it must answer even
 while every upstream route is down.
@@ -112,13 +138,14 @@ while every upstream route is down.
 ## CLI reference
 
 ```
-node router-relay.js [--port 8765] [--host URL] [--host-reserved URL] [--key KEY]
-                     [--model ID] [--conf path] [--proxy URL] [--log FILE] [-v]
+node router-relay.js [--port 8765] [--stream off|on|auto] [--host URL] [--host-reserved URL]
+                     [--key KEY] [--model ID] [--conf path] [--proxy URL] [--log FILE] [-v]
 ```
 
 | Flag | Alias | Default | Meaning |
 |---|---|---|---|
-| `--port` | `-p` | `8765` | TCP port on `127.0.0.1`. |
+| `--port` | `-p` | `conf.txt` `port`, else `8765` | TCP port on `127.0.0.1`. `0` = let the OS pick. |
+| `--stream` | `-s` | `conf.txt` `stream`, else `off` | Streaming mode: `off`, `on` or `auto`. |
 | `--host` | `-b` | `conf.txt` `base_url` | Override the main upstream URL. |
 | `--host-reserved` | `-B` | `conf.txt` `base_url_reserved` | Override the spare upstream URL. |
 | `--key` | `-k` | `conf.txt` `api_key` | Override the upstream API key. |
@@ -129,8 +156,16 @@ node router-relay.js [--port 8765] [--host URL] [--host-reserved URL] [--key KEY
 | `--verbose` | `-v` | off | Also echo diagnostics to the console. |
 | `--help` | `-h` | | Print the header comment of the script. |
 
-The relay refuses to start without a host and a key (exit code `2`), and exits with code
-`3` if the port is already in use.
+The relay refuses to start without a host and a key (exit code `2`), exits with code `2` on an
+invalid `--port` or `--stream` value, and exits with code `3` if the port is already in use.
+
+Running several relays side by side:
+
+```powershell
+node router-relay.js --port 8765
+node router-relay.js --port 8766 --log relay-8766.log
+node router-relay.js --port 0 --log relay-auto.log   # OS picks, see the log line
+```
 
 ## Resilience
 
@@ -206,7 +241,7 @@ normally use in Cline (its model, key and base URL) stays exactly as it is and p
 | Parameter | Default | Meaning |
 |---|---|---|
 | `-Workspace <dir>` | current directory | Forwarded to the CLI as `--cwd`. |
-| `-RelayPort <port>` | `8765` | Port of the local relay (shared with `Start-Hermes.ps1`). |
+| `-RelayPort <port>` | `conf.txt` `port`, else `8765` | Port of the local relay (shared with `Start-Hermes.ps1`). With `port=0` a free port is picked for this run. |
 | `-ProfileDir <dir>` | `<script dir>\cline-router` | Root of the isolated profile. |
 | `-SyncProvider` | off | Force a rewrite of the profile from `conf.txt` and the default model metadata. Idempotent; run it after editing `conf.txt` or changing `-RelayPort`. |
 | `-NoRelay` | off | Point the profile straight at `conf.txt` `base_url`. The router does not terminate SSE streams, so long answers will fail with `ECONNRESET` — debugging only. |
@@ -231,7 +266,7 @@ Starts the relay if needed, warns when the local proxy port is not listening, th
 | Parameter | Default | Meaning |
 |---|---|---|
 | `-SkipRelayCheck` | off | Do not touch the relay — just run Hermes. |
-| `-RelayPort <port>` | `8765` | Port to verify/start. |
+| `-RelayPort <port>` | `conf.txt` `port`, else `8765` | Port to verify/start. `port=0` picks a free port for this run. |
 | `-HermesArgs` | | Remaining arguments are passed to the Hermes CLI unchanged. |
 
 ```powershell
@@ -243,12 +278,42 @@ Starts the relay if needed, warns when the local proxy port is not listening, th
 > Both launchers warn if the proxy port (`10809` by default) is not listening, because
 > the relay needs it to reach the router when `proxy=` is set.
 
+### `Stop-Relay.ps1`
+
+Stops relay instances. A relay is identified **positively** before anything is killed, because
+"whatever listens on 8765" is not the same thing as "the relay":
+
+1. the process command line runs `router-relay.js`, **and**
+2. it answers `/health` on the port with a `pid` matching the listener's process id.
+
+If a port is held by something else, the script says so and leaves it running (exit code `1`).
+The port of a relay is found from its listening socket, its `/health` answer, or its command line —
+so a relay started with no `--port` (port from `conf.txt`) or with `--port 0` is still found.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `-Port <port>[,<port>]` | | Stop the relay(s) on these ports. Omit with `-All` to list instead. |
+| `-All` | off | Stop every relay process on the machine. |
+| `-Force` | off | Do not ask for confirmation when stopping several at once. |
+
+```powershell
+.\Stop-Relay.ps1                  # list running relays (PID, port, stream, upstream)
+.\Stop-Relay.ps1 -Port 8765       # stop the relay on 8765
+.\Stop-Relay.ps1 -Port 8765,8766  # stop two, after confirmation
+.\Stop-Relay.ps1 -All             # stop every relay
+.\Stop-Relay.ps1 -All -WhatIf     # dry run: show what would be stopped
+```
+
+Processes whose command line cannot be read (another user, no elevation) are reported and never
+touched. Exit codes: `0` — done or nothing to do, `1` — a port was refused or a stop failed.
+
 ## Repository layout
 
 ```
 router-relay.js        the relay (single file, no dependencies)
 Start-Cline.ps1        Cline CLI launcher on an isolated profile
 Start-Hermes.ps1       Hermes Agent CLI launcher
+Stop-Relay.ps1         stops relays by port, or all of them
 conf.example.txt       config template — copy to conf.txt and fill in
 .gitignore             keeps conf.txt, the isolated profile and logs out of git
 .gitattributes         LF for code/config, CRLF for PowerShell

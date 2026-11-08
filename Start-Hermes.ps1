@@ -16,7 +16,8 @@
     Do not touch the relay at all - just run Hermes.
 
 .PARAMETER RelayPort
-    Relay port to verify/start. Default: 8765.
+    Relay port to verify/start. Default: from conf.txt `port`, otherwise 8765.
+    Pass it explicitly to point the launcher at a specific instance.
 
 .PARAMETER HermesArgs
     Any remaining arguments are passed to the Hermes CLI unchanged.
@@ -37,7 +38,7 @@
 param(
     [switch]$SkipRelayCheck,
 
-    [int]$RelayPort = 8765,
+    [int]$RelayPort = 0,
 
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$HermesArgs
@@ -45,6 +46,58 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Read-ApiConf {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $values = @{}
+    foreach ($line in (Get-Content -LiteralPath $Path)) {
+        $entry = $line.Trim()
+        if (-not $entry -or $entry.StartsWith('#') -or $entry.StartsWith(';')) { continue }
+
+        $separator = $entry.IndexOf('=')
+        if ($separator -lt 1) { continue }
+
+        $key = $entry.Substring(0, $separator).Trim()
+        $value = $entry.Substring($separator + 1).Trim()
+        if ($key) { $values[$key] = $value }
+    }
+
+    return $values
+}
+
+function Resolve-RelayPort {
+    <#
+        Resolves the relay port: explicit -RelayPort, then conf.txt `port`, then 8765.
+        conf.txt `port=0` means "any free port" - which a launcher cannot use, because it has to know
+        the address it verifies. A concrete free port is chosen instead.
+    #>
+    param([int]$Requested)
+
+    if ($Requested -gt 0) { return $Requested }
+
+    $resolved = 8765
+    $confPath = Join-Path -Path $PSScriptRoot -ChildPath 'conf.txt'
+    if (Test-Path -LiteralPath $confPath) {
+        $conf = Read-ApiConf -Path $confPath
+        if ($conf.ContainsKey('port')) {
+            $parsed = 0
+            if ([int]::TryParse($conf['port'], [ref]$parsed) -and $parsed -ge 0 -and $parsed -le 65535) {
+                $resolved = $parsed
+            }
+        }
+    }
+
+    if ($resolved -eq 0) {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $listener.Start()
+        $resolved = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+        $listener.Stop()
+        Write-Host "conf.txt asks for port 0 (any free port); using $resolved for this run." -ForegroundColor DarkGray
+    }
+
+    return $resolved
+}
 
 function Resolve-HermesCommand {
     $candidates = @(
@@ -86,6 +139,9 @@ function Start-ClineRelay {
 }
 
 $hermesCommand = Resolve-HermesCommand
+
+# Resolved once: -RelayPort, then conf.txt `port`, then 8765.
+$RelayPort = Resolve-RelayPort -Requested $RelayPort
 
 if (-not $SkipRelayCheck) {
     if (Test-ClineRelay -Port $RelayPort) {

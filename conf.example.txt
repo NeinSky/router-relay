@@ -5,3 +5,16 @@ model=your-model-id
 
 # Optional: route upstream requests through a local HTTP proxy. Empty = direct.
 proxy=
+
+# Optional: TCP port on 127.0.0.1. Empty or absent = 8765. Use 0 to let the OS pick a free port
+# (the real port is printed at startup and reported by /health), or any other number to run
+# several relays side by side. --port on the command line overrides this.
+port=8765
+
+# Optional: how streaming answers are handled. --stream on the command line overrides this.
+#   off  - always ask the upstream for a complete JSON answer and replay it as SSE (default).
+#          Works everywhere, including upstreams that drop the connection mid-stream.
+#   on   - pass the upstream SSE stream straight through. Lower latency and real incremental
+#          output, but only for an upstream that terminates the stream (finish_reason + [DONE]).
+#   auto - try passthrough, fall back to buffering when the stream turns out to be broken.
+stream=off
