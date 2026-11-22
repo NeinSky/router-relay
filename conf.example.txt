@@ -4,6 +4,8 @@ api_key=sk-REPLACE_ME
 model=your-model-id
 
 # Optional: route upstream requests through a local HTTP proxy. Empty = direct.
+# The tunnel is built with CONNECT by the relay itself, so proxied requests stream exactly like
+# direct ones. Requires an https:// base_url.
 proxy=
 
 # Optional: TCP port on 127.0.0.1. Empty or absent = 8765. Use 0 to let the OS pick a free port
@@ -18,3 +20,21 @@ port=8765
 #          output, but only for an upstream that terminates the stream (finish_reason + [DONE]).
 #   auto - try passthrough, fall back to buffering when the stream turns out to be broken.
 stream=off
+
+# Optional: which path is tried first. --route-order overrides this.
+#   direct-first - direct, then the proxy (default). Faster when the direct path works.
+#   proxy-first  - the proxy, then direct. Use it when direct is blocked: there every direct
+#                  attempt costs 10-20 s before the tunnel is even tried.
+route_order=direct-first
+
+# Optional: seconds one upstream attempt may take before it is abandoned. Default 120.
+timeout=120
+
+# Optional: seconds the whole request may take, across every route and both passes. Default 240.
+# Keep this below the client's own timeout (Cline uses 300) so a stuck turn fails cleanly instead
+# of retrying long after the client gave up.
+budget=240
+
+# Optional: re-probe cooling routes in the background (on/off, default on) so a recovered path
+# comes back without a user request paying for the discovery.
+probe=on

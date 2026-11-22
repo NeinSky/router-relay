@@ -3,16 +3,20 @@
  * router-relay.js - local OpenAI-compatible shim for Cline.
  *
  * WHY THIS EXISTS
- *   The upstream router (router.cheap / direct.router-cheap.com) accepts SSE requests but never
- *   finishes them: it sends content chunks, then drops the connection without a `finish_reason`
+ *   The upstream router (router.cheap / direct.router-cheap.com) used to accept SSE requests but
+ *   never finish them: it sent content chunks, then dropped the connection without a `finish_reason`
  *   chunk and without `data: [DONE]`. Cline (which always streams - it calls streamText and has no
- *   non-streaming fallback) therefore reports:
+ *   non-streaming fallback) therefore reported:
  *
  *     Error: Failed to process successful response: TypeError: The socket connection was closed
  *     unexpectedly. ... (ECONNRESET)
  *
- *   The same router answers perfectly when asked with "stream": false: the full message, a proper
- *   finish_reason and the usage block all arrive in one JSON body.
+ *   The same router answered perfectly when asked with "stream": false: the full message, a proper
+ *   finish_reason and the usage block all arrived in one JSON body.
+ *
+ *   The router has since been fixed and does terminate its streams, so `stream=on` / `stream=auto`
+ *   are now real options. The replay path stays the default because it works with either kind of
+ *   upstream, and because it is the only mode that survives a router which drops a stream again.
  *
  * WHAT IT DOES
  *   Serves /v1/chat/completions on 127.0.0.1, rewrites the request to "stream": false, calls the
@@ -28,11 +32,14 @@
  *
  * USAGE
  *   node router-relay.js [--port 8765] [--stream off|on|auto] [--host URL] [--host-reserved URL]
- *                        [--key KEY] [--model ID] [--conf path] [--proxy URL] [--log FILE] [-v]
+ *                        [--key KEY] [--model ID] [--conf path] [--proxy URL] [--log FILE]
+ *                        [--route-order direct-first|proxy-first] [--timeout SEC] [--budget SEC]
+ *                        [--probe on|off] [-v]
  *
  *   Defaults come from conf.txt next to this file (base_url - the main address - then
- *   base_url_reserved; api_key; port; stream). Use --host to point the relay somewhere else.
- *   The model is taken from the incoming request, so Cline may switch models freely.
+ *   base_url_reserved; api_key; port; stream; proxy; route_order; timeout; budget; probe). Use
+ *   --host to point the relay somewhere else. The model is taken from the incoming request, so
+ *   Cline may switch models freely.
  *
  *   PORT. --port wins over conf.txt `port`, which wins over 8765. A port of 0 lets the OS pick a
  *   free one; the real number is printed at startup and reported by /health. This is what makes
@@ -42,7 +49,16 @@
  *   as a valid SSE stream - the original workaround for routers that never finish a stream.
  *   `stream=on` passes the upstream SSE through untouched: lower latency and genuinely incre-
  *   mental output, but only for an upstream that terminates its stream. `stream=auto` tries the
- *   passthrough and falls back to replay when the stream turns out to be broken.
+ *   passthrough and falls back to replay when the stream turns out to be broken. All three work
+ *   through the proxy too - the transport is Node's own HTTP client over a CONNECT tunnel.
+ *
+ *   ROUTE ORDER. `route_order=direct-first` (default) tries the direct path before the proxy
+ *   because it is faster. `proxy-first` is for a machine where direct is blocked: there every
+ *   direct attempt costs 10-20 s before the tunnel is even tried.
+ *
+ *   BUDGET. `timeout` caps one attempt, `budget` caps the whole request across every route and
+ *   both passes. Together they keep the relay inside the client's own timeout, so a stuck turn
+ *   ends with a clear 502 instead of retrying for an hour after the client gave up.
  *
  * ENDPOINTS
  *   POST /v1/chat/completions   translated to the upstream router
@@ -58,20 +74,27 @@
  *   regions (a block or challenge), while the local proxy can equally be down. So instead of
  *   picking one, every request walks an ordered route list - direct on the main host, then the
  *   proxy, then the reserved host, and so on - and a second pass re-walks it, because the router
- *   also flakes on its own. Direct is first because it is faster and needs no proxy. Failover
- *   triggers on transport errors and on 403/408/429/5xx; a 400/401/404 is returned immediately so a
- *   caller-side mistake is not retried across the whole list. A route that fails cools down with
- *   exponential backoff (60s doubling to a 15-minute ceiling), because a blocked connection can take
- *   ~19s to surface and re-paying that per request is worse than the outage it guards against. The
- *   strikes are cleared on success, so a recovered direct path comes back on its own.
+ *   also flakes on its own. Direct is first because it is faster and needs no proxy, unless
+ *   `route_order=proxy-first` says otherwise. Failover triggers on transport errors and on
+ *   403/408/429/5xx; a 400/401/404 is returned immediately so a caller-side mistake is not retried
+ *   across the whole list. A route that fails cools down with exponential backoff (60 s doubling to
+ *   a 15-minute ceiling), because a blocked connection can take ~19 s to surface and re-paying that
+ *   per request is worse than the outage it guards against. A cooling route is re-probed in the
+ *   background, so a recovered path comes back without a user request paying for the discovery.
+ *
+ *   Client identity. The router only serves traffic it recognises as a mainstream coding CLI, so
+ *   the client's User-Agent is forwarded upstream. A router that answers 200 with a policy notice
+ *   instead of a completion ("本站仅限主流 Coding 客户端/CLI 使用...") is reported as a 502 error rather
+ *   than replayed as an assistant message.
  */
 
 'use strict';
 
 const http = require('node:http');
+const https = require('node:https');
+const tls = require('node:tls');
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
 const { Readable } = require('node:stream');
 
 const DEFAULT_PORT = 8765;
@@ -85,19 +108,36 @@ const DEFAULT_STREAM_MODE = 'off';
 // plenty - the sentinel is always the last event - and it keeps the detector from buffering a whole
 // (possibly huge) answer just to answer "did this stream terminate?".
 const PASSTHROUGH_TAIL_CHARS = 2048;
-const REQUEST_TIMEOUT_MS = 600000; // 10 min per attempt: reasoning models can think for a long time
+// One attempt must be long enough for a slow reasoning turn, but short enough that the failover
+// budget below still fits inside the client's own timeout (Cline uses 5 minutes).
+const REQUEST_TIMEOUT_MS = 120000;
+// The whole request - every route, both passes - is capped by one deadline. The old code had no
+// deadline at all: 4 routes x 2 passes x a 10-minute timeout meant a single turn could hang for up
+// to 80 minutes while the client had given up after five and the router kept billing for tokens
+// nobody would read.
+const REQUEST_BUDGET_MS = 240000;
+// A proxy CONNECT is a plain TCP handshake plus a TLS handshake; 15 s is generous and keeps a dead
+// tunnel from eating the whole budget.
+const CONNECT_TIMEOUT_MS = 15000;
 // Failover budget: each route in the list is tried once per pass, and a second pass re-walks the
 // whole list because the upstream router also flakes on its own, independently of which route we
 // picked. Normal traffic succeeds on route 1 and never pays for the rest.
 const ROUTE_PASSES = 2;
-// A blocked route does not fail fast: a Cloudflare-reset connection can take ~19s to surface, and
-// paying that on every single request would be worse than the outage it protects against. So a
-// route that fails is put in the corner and the healthy routes are tried first, with the wait
-// doubling per consecutive failure up to a ceiling - a persistent block ends up costing one slow
-// probe every 15 minutes instead of one per request. A route is never dropped outright: on success
-// its strikes are cleared, so a recovered direct path returns on its own.
+// How long a route that failed stays out of the way (60 s, doubling to 15 minutes). A blocked
+// route does not fail fast: a Cloudflare-reset connection can take ~19 s to surface, and paying
+// that on every request would be worse than the outage it protects against.
 const ROUTE_COOLDOWN_MS = 60000;
 const ROUTE_COOLDOWN_MAX_MS = 900000;
+// A cooling route is re-probed on its own instead of on the back of a user request. Without this
+// a recovered route only returned when its cooldown happened to expire in the middle of a turn,
+// and the "strike" counters grew forever (they reached 189/75 on a ten-day-old process).
+const ROUTE_PROBE_MS = 300000;
+
+// How the route list is ordered. "direct-first" is faster and needs no proxy; "proxy-first" is for
+// a machine where the direct path is blocked (Cloudflare challenge, ISP filter, region block) -
+// there every direct attempt costs 10-20 s before the tunnel is even tried.
+const ROUTE_ORDERS = ['direct-first', 'proxy-first'];
+const DEFAULT_ROUTE_ORDER = 'direct-first';
 
 function parseArgs(argv) {
 	// port and stream stay null until the config file has been consulted, otherwise an explicit
@@ -114,6 +154,10 @@ function parseArgs(argv) {
 		else if (a === '--conf') opts.conf = argv[++i];
 		else if (a === '--log') opts.log = argv[++i];
 		else if (a === '--proxy') opts.proxy = argv[++i];
+		else if (a === '--route-order' || a === '-r') opts.routeOrder = argv[++i];
+		else if (a === '--timeout' || a === '-t') opts.timeout = argv[++i];
+		else if (a === '--budget') opts.budget = argv[++i];
+		else if (a === '--probe') opts.probe = argv[++i];
 		else if (a === '--verbose' || a === '-v') opts.verbose = true;
 		else if (a === '--help' || a === '-h') opts.help = true;
 	}
@@ -197,6 +241,43 @@ function resolveStreamMode(cliMode, confMode) {
 	return mode;
 }
 
+// Route order precedence follows the port and the stream mode: command line, then conf.txt, then
+// the built-in default. An unknown value is a configuration mistake and exits, exactly like a bad
+// stream mode - silently ignoring it would change the behaviour of every request.
+function resolveRouteOrder(cliOrder, confOrder) {
+	const raw = cliOrder !== null && cliOrder !== undefined ? cliOrder : confOrder;
+	if (raw === undefined || raw === null || raw === '') return DEFAULT_ROUTE_ORDER;
+	const order = String(raw).trim().toLowerCase();
+	if (!ROUTE_ORDERS.includes(order)) {
+		console.error('router-relay: invalid route_order "' + raw + '" (expected one of: ' + ROUTE_ORDERS.join(', ') + ')');
+		process.exit(2);
+	}
+	return order;
+}
+
+// Timeouts are written in seconds in conf.txt and used in milliseconds. A non-numeric value is a
+// typo that would otherwise turn into a mystery hang, so it exits like a missing host.
+function resolveSeconds(cliValue, confValue, fallbackMs, name) {
+	const raw = cliValue !== null && cliValue !== undefined ? cliValue : confValue;
+	if (raw === undefined || raw === null || raw === '') return fallbackMs;
+	const seconds = Number(raw);
+	if (!Number.isFinite(seconds) || seconds <= 0) {
+		console.error('router-relay: invalid ' + name + ' "' + raw + '" (expected a positive number of seconds)');
+		process.exit(2);
+	}
+	return Math.round(seconds * 1000);
+}
+
+function resolveProbe(cliValue, confValue) {
+	const raw = cliValue !== null && cliValue !== undefined ? cliValue : confValue;
+	if (raw === undefined || raw === null || raw === '') return true;
+	const value = String(raw).trim().toLowerCase();
+	if (value === 'on' || value === 'true' || value === '1') return true;
+	if (value === 'off' || value === 'false' || value === '0') return false;
+	console.error('router-relay: invalid probe "' + raw + '" (expected on or off)');
+	process.exit(2);
+}
+
 function sendJson(res, status, obj) {
 	const body = Buffer.from(JSON.stringify(obj), 'utf8');
 	res.writeHead(status, { 'content-type': 'application/json', 'content-length': body.length });
@@ -212,60 +293,218 @@ function readBody(req) {
 	});
 }
 
-// Upstream request through a local HTTP proxy (HAPP / xray, e.g. http://127.0.0.1:10809).
-// Node 22's fetch ignores HTTP_PROXY and undici is not a public module there, so curl does the
-// tunnel: it handles CONNECT, chunked responses and timeouts, and it is present on every Windows
-// box we target. The body goes in over stdin, the status code comes back via -w.
-function requestViaCurl(opts, proxy, url, options) {
-	return new Promise((resolve, reject) => {
-		const curl = process.platform === 'win32' ? 'curl.exe' : 'curl';
-		const args = [
-			'-s', '-S',
-			'--proxy', proxy,
-			'--max-time', String(Math.round((options.timeoutMs || REQUEST_TIMEOUT_MS) / 1000)),
-			'-X', options.method || 'GET',
-		];
-		for (const [name, value] of Object.entries(options.headers || {})) {
-			args.push('-H', name + ': ' + value);
-		}
-		if (options.body !== undefined) args.push('--data-binary', '@-');
-		args.push('-w', '\n__CURL_STATUS__%{http_code}', url);
+// --- transport ------------------------------------------------------------------------------
+// The upstream is reached with Node's own HTTP client, either directly or through a local HTTP
+// proxy via CONNECT. A native client replaced the original "one curl process per request"
+// workaround, which had three costs that all surfaced as "the relay barely works":
+//
+//   * it buffered every body, so SSE passthrough was impossible through the proxy - the only
+//     route that works when the region is blocked - and every answer arrived at once;
+//   * it paid a process spawn and a fresh TLS handshake per request (~0.3-1 s on every turn);
+//   * on Windows it used Schannel, which intermittently failed inside the HAPP tunnel with
+//     "SEC_E_DECRYPT_FAILURE" / "missing close_notify" - a phantom failure on a healthy route.
+//
+// Keep-alive agents make both paths behave the same, so stream=on and stream=auto now really do
+// stream through the proxy. Only HTTPS upstreams are tunnelled; an http:// base_url with proxy= is
+// rejected at startup instead of being silently sent in the clear.
+const agents = new Map();
+const directAgent = new https.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
 
-		const child = spawn(curl, args, { windowsHide: true });
-		const outChunks = [];
-		const errChunks = [];
-		child.stdout.on('data', (chunk) => outChunks.push(chunk));
-		child.stderr.on('data', (chunk) => errChunks.push(chunk));
-		child.on('error', reject);
-		child.on('close', (code) => {
-			const combined = Buffer.concat(outChunks).toString('utf8');
-			const marker = '__CURL_STATUS__';
-			const at = combined.lastIndexOf(marker);
-			if (code !== 0 || at < 0) {
-				const detail = Buffer.concat(errChunks).toString('utf8').trim();
-				reject(new Error('curl via proxy failed (rc=' + code + ')' + (detail ? ': ' + detail.slice(0, 160) : '')));
-				return;
-			}
-			resolve({ status: Number(combined.slice(at + marker.length).trim()), text: combined.slice(0, at) });
+// An https.Agent whose sockets are opened with the proxy's CONNECT method and then wrapped in TLS.
+// Keep-alive lives in the base class, so one tunnel is reused across turns exactly like a direct
+// connection would be.
+class ProxyAgent extends https.Agent {
+	constructor(proxyUrl) {
+		super({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
+		this.proxy = new URL(proxyUrl);
+		this.auth = null;
+		if (this.proxy.username) {
+			const credentials = decodeURIComponent(this.proxy.username) + ':' + decodeURIComponent(this.proxy.password || '');
+			this.auth = 'Basic ' + Buffer.from(credentials, 'utf8').toString('base64');
+		}
+	}
+
+	// The tunnel target is part of the pool key: one proxy serves several upstream hosts.
+	getName(options) {
+		return 'proxy:' + this.proxy.host + '|' + super.getName(options);
+	}
+
+	createConnection(options, cb) {
+		const host = options.host || options.servername;
+		const port = Number(options.port) || 443;
+		const authority = host + ':' + port;
+		const headers = { host: authority };
+		if (this.auth) headers['proxy-authorization'] = this.auth;
+
+		const library = this.proxy.protocol === 'https:' ? https : http;
+		const connectReq = library.request({
+			host: this.proxy.hostname,
+			port: Number(this.proxy.port) || (this.proxy.protocol === 'https:' ? 443 : 80),
+			method: 'CONNECT',
+			path: authority,
+			headers,
+			agent: false,
 		});
 
-		if (options.body !== undefined) child.stdin.end(options.body);
-		else child.stdin.end();
+		let settled = false;
+		const fail = (err) => {
+			if (settled) return;
+			settled = true;
+			connectReq.destroy();
+			cb(err);
+		};
+
+		connectReq.setTimeout(CONNECT_TIMEOUT_MS, () => fail(new Error('proxy CONNECT to ' + authority + ' timed out')));
+		connectReq.once('error', fail);
+		connectReq.once('connect', (response, socket, head) => {
+			if (settled) {
+				socket.destroy();
+				return;
+			}
+			if (response.statusCode !== 200) {
+				socket.destroy();
+				fail(new Error('proxy CONNECT to ' + authority + ' failed with ' + response.statusCode));
+				return;
+			}
+			settled = true;
+			// Bytes the proxy sent right after its 200 line belong to the tunnelled stream.
+			if (head && head.length) socket.unshift(head);
+			cb(null, tls.connect({
+				socket,
+				servername: options.servername || host,
+				rejectUnauthorized: options.rejectUnauthorized !== false,
+			}));
+		});
+		connectReq.end();
+	}
+}
+
+function agentFor(route) {
+	if (!route.proxy) return directAgent;
+	let agent = agents.get(route.proxy);
+	if (!agent) {
+		agent = new ProxyAgent(route.proxy);
+		agents.set(route.proxy, agent);
+	}
+	return agent;
+}
+
+// One request on one route, buffered or streaming. The streaming variant resolves as soon as the
+// status line and headers are in, which is what lets the relay decide to fail over *before* a byte
+// reaches the client; the buffered variant resolves once the body has been read to the end.
+function requestOverHttp(opts, route, pathname, options) {
+	const url = new URL(route.host.replace(/\/+$/, '') + pathname);
+	const secure = url.protocol !== 'http:';
+	const library = secure ? https : http;
+	const headers = { ...(options.headers || {}) };
+	if (options.body !== undefined) headers['content-length'] = Buffer.byteLength(options.body);
+	if (options.stream) headers.accept = 'text/event-stream';
+
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const settle = (fn, value) => {
+			if (settled) return false;
+			settled = true;
+			fn(value);
+			return true;
+		};
+
+		const req = library.request({
+			host: url.hostname,
+			port: url.port || (secure ? 443 : 80),
+			path: url.pathname + (url.search || ''),
+			method: options.method || (options.stream ? 'POST' : 'GET'),
+			headers,
+			agent: agentFor(route),
+		});
+
+		const timeoutMs = options.timeoutMs || REQUEST_TIMEOUT_MS;
+		const timeoutError = () => new Error('upstream timed out after ' + Math.round(timeoutMs / 1000) + 's on ' + describeRoute(route));
+		// req.setTimeout only starts once a socket is assigned, so it does not cover a TCP connect
+		// that never completes (a non-routable address hangs for ~21 s before the OS gives up). This
+		// hard deadline is what makes `budget` an actual guarantee.
+		const deadline = setTimeout(() => req.destroy(timeoutError()), timeoutMs);
+		if (typeof deadline.unref === 'function') deadline.unref();
+		const stopDeadline = () => clearTimeout(deadline);
+
+		req.setTimeout(timeoutMs, () => req.destroy(timeoutError()));
+		req.on('error', (err) => {
+			stopDeadline();
+			settle(reject, err);
+		});
+
+		// A vanished client must stop the upstream request too: a cheap router still bills for
+		// tokens nobody reads, and the old relay happily finished answers Cline had abandoned.
+		if (options.signal) {
+			const onAbort = () => req.destroy(new Error('client disconnected'));
+			if (options.signal.aborted) onAbort();
+			else options.signal.addEventListener('abort', onAbort, { once: true });
+		}
+
+		req.on('response', (response) => {
+			const contentType = response.headers['content-type'] || 'application/json';
+			// Headers are in: the connect phase is over. From here the body gets its own idle
+			// timeout, so a slow but live stream is not cut off by the attempt deadline.
+			stopDeadline();
+			if (options.stream) {
+				response.setTimeout(timeoutMs, () => response.destroy(timeoutError()));
+				settle(resolve, {
+					ok: response.statusCode >= 200 && response.statusCode < 300,
+					status: response.statusCode,
+					contentType,
+					body: response,
+					route: describeRoute(route),
+				});
+				return;
+			}
+
+			const chunks = [];
+			response.on('data', (chunk) => chunks.push(chunk));
+			response.on('error', (err) => settle(reject, err));
+			response.on('end', () => {
+				settle(resolve, {
+					ok: response.statusCode >= 200 && response.statusCode < 300,
+					status: response.statusCode,
+					contentType,
+					text: Buffer.concat(chunks).toString('utf8'),
+					route: describeRoute(route),
+				});
+			});
+		});
+
+		if (options.body !== undefined) req.end(options.body);
+		else req.end();
 	});
 }
 
-// Ordered failover routes. Direct comes first: it is the fastest path (no tunnel - roughly 80ms
-// of TLS against ~300ms through the proxy) and it has no dependency on the local proxy being up.
-// The proxy follows immediately, because when Cloudflare blocks the region every direct host fails
-// together - both hostnames are the same zone, so trying the reserved host direct before the proxy
-// only adds a doomed attempt. The reserved host is still walked, for the case where a single
-// hostname is having trouble rather than the whole zone.
+function requestOnce(opts, route, pathname, options) {
+	return requestOverHttp(opts, route, pathname, { ...options, stream: false });
+}
+
+// Streaming sibling of requestOnce: it resolves with the live response object instead of a body
+// that has already been read.
+function requestStreamOnce(opts, route, pathname, options) {
+	return requestOverHttp(opts, route, pathname, { ...options, stream: true });
+}
+
+
+// Ordered failover routes. Direct comes first by default: it is the fastest path (no tunnel -
+// roughly 80 ms of TLS against ~300 ms through the proxy) and it has no dependency on the local
+// proxy being up. The proxy follows immediately, because when Cloudflare blocks the region every
+// direct host fails together - both hostnames are the same zone, so trying the reserved host direct
+// before the proxy only adds a doomed attempt. The reserved host is still walked, for the case where
+// a single hostname is having trouble rather than the whole zone.
+//
+// `route_order=proxy-first` reverses that within each host. It exists because "direct is faster"
+// stops being true the moment the direct path is blocked: on such a machine every direct attempt
+// costs 10-20 s before the tunnel is even tried, and the tunnel is the only thing that works.
 function buildRoutes(opts) {
 	const hosts = [];
 	if (opts.host) hosts.push(opts.host);
 	if (opts.hostReserved && !hosts.includes(opts.hostReserved)) hosts.push(opts.hostReserved);
 	const proxies = [''];
 	if (opts.proxy) proxies.push(opts.proxy);
+	if (opts.proxy && opts.routeOrder === 'proxy-first') proxies.reverse();
 	const routes = [];
 	for (const host of hosts) {
 		for (const proxy of proxies) routes.push({ host, proxy });
@@ -285,73 +524,9 @@ function isRetryableStatus(status) {
 	return status === 403 || status === 408 || status === 429 || status >= 500;
 }
 
-// One transport attempt on one route. An empty proxy means Node's own fetch, which genuinely goes
-// direct (undici ignores HTTP_PROXY/HTTPS_PROXY); otherwise curl performs the tunnel. A streaming
-// request accepts that only fetch can pass the bytes through - see requestStreamOnce.
-async function requestOnce(opts, route, pathname, options) {
-	const url = route.host.replace(/\/+$/, '') + pathname;
-	if (route.proxy) {
-		const result = await requestViaCurl(opts, route.proxy, url, options);
-		return {
-			ok: result.status >= 200 && result.status < 300,
-			status: result.status,
-			contentType: 'application/json',
-			text: result.text,
-		};
-	}
 
-	const init = {
-		method: options.method || 'GET',
-		headers: options.headers,
-		signal: AbortSignal.timeout(options.timeoutMs || REQUEST_TIMEOUT_MS),
-	};
-	if (options.body !== undefined) init.body = options.body;
 
-	const response = await fetch(url, init);
-	const text = await response.text();
-	return {
-		ok: response.ok,
-		status: response.status,
-		contentType: response.headers.get('content-type') || 'application/json',
-		text,
-	};
-}
 
-// Streaming counterpart of requestOnce. It exists as a separate function because the two differ in
-// the one way that matters: a buffered attempt has no usable answer until the body has been read to
-// the end, while a streaming attempt is decided at the response headers. fetch resolves on the
-// headers, so a 4xx/5xx or a failed connection is still seen - and retried - before a single byte
-// reaches the client. Only after the headers are known to be good does the relay commit to a route.
-//
-// Passthrough is fetch-only on purpose. The proxy transport is curl, and curl reports the status
-// code via -w at the *end* of the transfer; there is no point at which its headers can be handed to
-// the client before the answer exists. Saying so out loud beats a silently buffered "stream".
-function canStreamThrough(route) {
-	return !route.proxy;
-}
-
-async function requestStreamOnce(opts, route, pathname, options) {
-	if (!canStreamThrough(route)) {
-		const err = new Error('streaming passthrough is not available through the proxy transport (' + route.proxy + '); use stream=off for this route');
-		err.streamUnsupported = true;
-		throw err;
-	}
-
-	const url = route.host.replace(/\/+$/, '') + pathname;
-	const response = await fetch(url, {
-		method: options.method || 'POST',
-		headers: { ...options.headers, accept: 'text/event-stream' },
-		body: options.body,
-		signal: AbortSignal.timeout(options.timeoutMs || REQUEST_TIMEOUT_MS),
-	});
-
-	return {
-		ok: response.ok,
-		status: response.status,
-		contentType: response.headers.get('content-type') || 'text/event-stream',
-		body: response.body,
-	};
-}
 
 // Routes in the order they should be attempted: healthy ones first (in configured order), then any
 // that are cooling down. A cooling route is never dropped - if the healthy ones also fail, the
@@ -385,24 +560,60 @@ function coolDownRoute(opts, route) {
 function clearCooldown(opts, route) {
 	if (opts.routeCooldown) opts.routeCooldown.delete(describeRoute(route));
 }
+// Transports hide the useful half of a failure in `cause`; the old log only ever said "fetch
+// failed", which is why a permanently blocked direct route looked like an unexplained mystery.
+function describeError(err) {
+	if (!err) return 'unknown error';
+	let text = err.message || String(err);
+	let cause = err.cause;
+	for (let depth = 0; cause && depth < 3; depth++) {
+		const part = cause.code || cause.message || String(cause);
+		if (part && !text.includes(String(part))) text += ' (' + part + ')';
+		cause = cause.cause;
+	}
+	return text;
+}
+
+// How long the next attempt may take: never longer than one attempt, never past the request
+// deadline. 0 means the budget is spent and the caller should stop walking routes - that is what
+// keeps the relay inside the client's own timeout instead of retrying long after it gave up.
+function attemptTimeout(opts, deadline) {
+	const remaining = deadline - Date.now();
+	if (remaining < 1000) return 0;
+	return Math.min(opts.timeoutMs || REQUEST_TIMEOUT_MS, remaining);
+}
+
+
 
 async function requestUpstream(opts, pathname, options) {
 	// transport + body read + (by the caller) JSON.parse are one retryable unit: the upstream router
 	// sometimes drops the connection while the body is still being read, which used to bubble up as
 	// an unhandled rejection and kill the process.
 	const routes = routeOrder(opts);
+	const budgetMs = options.budgetMs || opts.budgetMs || REQUEST_BUDGET_MS;
+	const deadline = Date.now() + budgetMs;
 	let lastErr = null;
 	let lastResponse = null;
 
 	for (let pass = 0; pass < ROUTE_PASSES; pass++) {
+		let spent = false;
 		for (const route of routes) {
+			const timeoutMs = attemptTimeout(opts, deadline);
+			if (timeoutMs === 0) {
+				spent = true;
+				break;
+			}
+
 			let result;
 			try {
-				result = await requestOnce(opts, route, pathname, options);
+				result = await requestOnce(opts, route, pathname, { ...options, timeoutMs });
 			} catch (err) {
 				lastErr = err;
+				// A client that hung up is not a sick route: stop walking the list instead of
+				// cooling down every route and burning the rest of the budget for nobody.
+				if (options.signal && options.signal.aborted) throw err;
 				const cool = coolDownRoute(opts, route);
-				log(opts, 'route failed (pass ' + (pass + 1) + '/' + ROUTE_PASSES + '), cooling ' + Math.round(cool.wait / 1000) + 's (strike ' + opts.routeCooldown.get(cool.key).strikes + '):', cool.key, '-', err && err.message ? err.message : String(err));
+				log(opts, 'route failed (pass ' + (pass + 1) + '/' + ROUTE_PASSES + '), cooling ' + Math.round(cool.wait / 1000) + 's (strike ' + opts.routeCooldown.get(cool.key).strikes + '):', cool.key, '-', describeError(err));
 				continue;
 			}
 			result.route = describeRoute(route);
@@ -418,6 +629,10 @@ async function requestUpstream(opts, pathname, options) {
 				log(opts, 'route recovered:', describeRoute(route), '-', result.status);
 			}
 			return result;
+		}
+		if (spent) {
+			lastErr = lastErr || new Error('request budget of ' + Math.round(budgetMs / 1000) + 's exhausted before the answer arrived');
+			break;
 		}
 	}
 
@@ -445,14 +660,26 @@ async function requestUpstreamStream(opts, pathname, options) {
 	}
 	let lastErr = null;
 	let lastResponse = null;
+	const budgetMs = options.budgetMs || opts.budgetMs || REQUEST_BUDGET_MS;
+	const deadline = Date.now() + budgetMs;
 
 	for (let pass = 0; pass < ROUTE_PASSES; pass++) {
+		let spent = false;
 		for (const route of routes) {
+			const timeoutMs = attemptTimeout(opts, deadline);
+			if (timeoutMs === 0) {
+				spent = true;
+				break;
+			}
+
 			let result;
 			try {
-				result = await requestStreamOnce(opts, route, pathname, options);
+				result = await requestStreamOnce(opts, route, pathname, { ...options, timeoutMs });
 			} catch (err) {
 				lastErr = err;
+				// A client that hung up is not a sick route: stop walking the list instead of
+				// cooling down every route and burning the rest of the budget for nobody.
+				if (options.signal && options.signal.aborted) throw err;
 				// A route that simply cannot do passthrough is not sick, so it must not be punished
 				// with a cooldown - that would only make the fallback slower on every request.
 				if (err && err.streamUnsupported) {
@@ -460,13 +687,20 @@ async function requestUpstreamStream(opts, pathname, options) {
 					continue;
 				}
 				const cool = coolDownRoute(opts, route);
-				log(opts, 'stream route failed (pass ' + (pass + 1) + '/' + ROUTE_PASSES + '), cooling ' + Math.round(cool.wait / 1000) + 's (strike ' + opts.routeCooldown.get(cool.key).strikes + '):', cool.key, '-', err && err.message ? err.message : String(err));
+				log(opts, 'stream route failed (pass ' + (pass + 1) + '/' + ROUTE_PASSES + '), cooling ' + Math.round(cool.wait / 1000) + 's (strike ' + opts.routeCooldown.get(cool.key).strikes + '):', cool.key, '-', describeError(err));
 				continue;
 			}
 			result.route = describeRoute(route);
 
 			if (isRetryableStatus(result.status)) {
 				lastResponse = result;
+				// The body is an open socket: dropping the reference without destroying it would
+				// leak the tunnel and keep the upstream generating tokens nobody reads.
+				try {
+					result.body.destroy();
+				} catch {
+					/* already gone */
+				}
 				const cool = coolDownRoute(opts, route);
 				log(opts, 'stream route gave retryable status (pass ' + (pass + 1) + '/' + ROUTE_PASSES + '), cooling ' + Math.round(cool.wait / 1000) + 's (strike ' + opts.routeCooldown.get(cool.key).strikes + '):', cool.key, '-', result.status);
 				continue;
@@ -477,9 +711,15 @@ async function requestUpstreamStream(opts, pathname, options) {
 			}
 			return result;
 		}
+		if (spent) {
+			lastErr = lastErr || new Error('request budget of ' + Math.round(budgetMs / 1000) + 's exhausted before the answer arrived');
+			break;
+		}
 	}
 
-	if (lastResponse) return lastResponse;
+	// The last response is only returned when it is a real upstream answer; its body has already
+	// been destroyed, so the caller sees the status and mirrors the error text itself.
+	if (lastResponse) return { ...lastResponse, text: lastResponse.text || '' };
 	throw lastErr || new Error('relay: every route failed');
 }
 
@@ -614,6 +854,26 @@ function replayAsStream(opts, res, upstream, model) {
 		res.end();
 	}
 }
+// Upstream bodies arrive as Node streams now (they used to be web streams from fetch). Both shapes
+// are accepted so a future transport change does not have to touch every consumer.
+function nodeStream(body) {
+	if (body && typeof body.pipe === 'function') return body;
+	return Readable.fromWeb(body);
+}
+
+// Drains a body into a string, tolerating a stream that dies halfway: the status code is what the
+// caller needs, and a partial error body is still more useful than nothing.
+function readStream(body) {
+	const source = nodeStream(body);
+	return new Promise((resolve) => {
+		const chunks = [];
+		const finish = () => resolve(Buffer.concat(chunks).toString('utf8'));
+		source.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+		source.on('error', finish);
+		source.on('end', finish);
+	});
+}
+
 // Copies an upstream SSE stream to the client as it arrives. The client gets exactly what the
 // upstream sent - no re-serialisation, no chunk sizing games - which is only safe when the upstream
 // terminates its stream properly. That is what the `stream` setting is for: `off` never takes this
@@ -637,7 +897,16 @@ function pipeStreamToClient(opts, res, upstream, model) {
 		});
 		if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-		const source = Readable.fromWeb(upstream.body);
+		const source = nodeStream(upstream.body);
+
+		// The client hanging up must also stop reading from the upstream: otherwise the tunnel
+		// stays open and the router keeps generating (and billing) tokens nobody will see.
+		res.on('close', () => {
+			if (!res.writableEnded && !source.destroyed) {
+				log(opts, 'client closed the stream early - aborting upstream', { bytes });
+				source.destroy();
+			}
+		});
 
 		source.on('data', (chunk) => {
 			const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -716,6 +985,19 @@ function replayAsJson(opts, res, upstream, model) {
 	}
 }
 
+// Some routers answer a blocked request with 200 and a policy notice in `content` instead of a
+// completion (the message this project was debugged against is
+// "本站仅限主流 Coding 客户端/CLI 使用...当前客户端不支持"). Replaying that as an assistant message makes
+// the client believe the model said it, so it is surfaced as an error instead.
+const POLICY_BLOCK_MARKERS = ['本站仅限', '当前客户端不支持'];
+
+function findPolicyBlock(json) {
+	const message = json && Array.isArray(json.choices) && json.choices[0] ? json.choices[0].message : null;
+	const content = message && typeof message.content === 'string' ? message.content : '';
+	if (!content) return null;
+	return POLICY_BLOCK_MARKERS.some((marker) => content.includes(marker)) ? content.trim() : null;
+}
+
 async function handleChat(opts, req, res) {
 	try {
 		let payload;
@@ -736,6 +1018,18 @@ async function handleChat(opts, req, res) {
 		payload.stream = false;
 		if (opts.model) payload.model = opts.model;
 		if (payload.stream_options) delete payload.stream_options;
+
+		// Abort the upstream attempt when the client goes away. Cline gives up on a turn after five
+		// minutes; without this the relay kept the request alive - and the router kept billing.
+		const controller = new AbortController();
+		res.on('close', () => {
+			if (!res.writableEnded) controller.abort();
+		});
+		// The upstream only accepts traffic it recognises as a mainstream coding CLI, so the
+		// client's own User-Agent is forwarded instead of sending none (Node sends none by default).
+		const clientAgent = req.headers['user-agent'];
+		const upstreamHeaders = { 'content-type': 'application/json', authorization: 'Bearer ' + opts.key };
+		if (clientAgent) upstreamHeaders['user-agent'] = clientAgent;
 
 		const model = payload.model;
 		const bodyText = JSON.stringify(payload);
@@ -764,19 +1058,20 @@ async function handleChat(opts, req, res) {
 			try {
 				streamed = await requestUpstreamStream(opts, '/chat/completions', {
 					method: 'POST',
-					headers: { 'content-type': 'application/json', authorization: 'Bearer ' + opts.key },
+					headers: upstreamHeaders,
 					body: streamPayload,
+					signal: controller.signal,
 				});
 			} catch (err) {
 				streamError = err;
 			}
 
-			// Passthrough could not even start: the proxy transport cannot do it, or every route is
-			// known to be broken. Nothing has been written to the client yet, so falling back to the
-			// replay path is free and turns a hard failure into a slower but correct answer.
+			// Passthrough could not even start: every route is known to drop streams. Nothing has
+			// been written to the client yet, so falling back to the replay path is free and turns
+			// a hard failure into a slower but correct answer - for this request only. Mutating
+			// opts.streamMode here used to disable streaming for the rest of the process.
 			if (streamError && streamError.streamUnsupported) {
 				log(opts, 'passthrough unavailable, falling back to replay:', streamError.message);
-				opts.streamMode = 'off';
 			} else if (streamError) {
 				const message = streamError && streamError.message ? streamError.message : String(streamError);
 				log(opts, 'stream upstream failed:', message);
@@ -786,12 +1081,7 @@ async function handleChat(opts, req, res) {
 				if (!streamed.ok) {
 					// Headers are known and bad: nothing has been sent to the client yet, so a clean error
 					// still works and the failover budget has already been spent on this status.
-					let text = '';
-					try {
-						text = await new Response(streamed.body).text();
-					} catch {
-						/* the body may already be gone; the status is what matters */
-					}
+					const text = await readStream(streamed.body);
 					log(opts, 'stream upstream status', streamed.status);
 					mirrorSafely(opts, res, streamed.status, streamed.contentType, text);
 					return;
@@ -813,8 +1103,9 @@ async function handleChat(opts, req, res) {
 		try {
 			upstream = await requestUpstream(opts, '/chat/completions', {
 				method: 'POST',
-				headers: { 'content-type': 'application/json', authorization: 'Bearer ' + opts.key },
+				headers: upstreamHeaders,
 				body: bodyText,
+				signal: controller.signal,
 			});
 		} catch (err) {
 			const message = err && err.message ? err.message : String(err);
@@ -845,6 +1136,13 @@ async function handleChat(opts, req, res) {
 			return;
 		}
 
+		const blocked = findPolicyBlock(json);
+		if (blocked) {
+			log(opts, 'upstream refused the request (policy gate):', blocked.slice(0, 200));
+			failSafely(opts, res, 502, { error: { message: 'router refused this request: ' + blocked, type: 'api_error' } });
+			return;
+		}
+
 		log(opts, 'upstream ok', { ms: Date.now() - started, finish: json.choices[0].finish_reason, mode: clientWantsStream ? 'sse' : 'json', route: upstream.route || null });
 		if (clientWantsStream) {
 			replayAsStream(opts, res, json, model);
@@ -872,6 +1170,38 @@ async function handleModels(opts, res) {
 	}
 }
 
+// A cooling route is re-probed on its own timer instead of on the back of a user request. Without
+// this a recovered route only came back when its cooldown happened to expire in the middle of a
+// turn, and the strike counters grew forever (they reached 189/75 on a ten-day-old process). The
+// probe is a cheap GET /models on one route at a time; failures stay silent because a still-blocked
+// route is the expected case and it already carries a strike.
+function startRouteProbe(opts) {
+	if (!opts.probe || opts.routes.length < 2) return null;
+	const timer = setInterval(async () => {
+		if (!opts.routeCooldown || opts.routeCooldown.size === 0) return;
+		const now = Date.now();
+		for (const route of opts.routes) {
+			const entry = opts.routeCooldown.get(describeRoute(route));
+			if (!entry || entry.until > now) continue;
+			try {
+				const result = await requestOnce(opts, route, '/models', {
+					headers: { authorization: 'Bearer ' + opts.key, 'user-agent': 'router-relay/probe' },
+					timeoutMs: CONNECT_TIMEOUT_MS * 2,
+				});
+				if (result.ok) {
+					clearCooldown(opts, route);
+					log(opts, 'probe recovered:', describeRoute(route), '-', result.status);
+				}
+			} catch {
+				/* still blocked - the cooldown already says so */
+			}
+		}
+	}, ROUTE_PROBE_MS);
+	// The probe must never be the reason the process stays alive.
+	if (typeof timer.unref === 'function') timer.unref();
+	return timer;
+}
+
 function main() {
 	const opts = parseArgs(process.argv.slice(2));
 	if (opts.help) {
@@ -890,16 +1220,21 @@ function main() {
 	opts.proxy = opts.proxy || conf.proxy || '';
 	opts.port = resolvePort(opts.port, conf.port);
 	opts.streamMode = resolveStreamMode(opts.stream, conf.stream);
+	opts.routeOrder = resolveRouteOrder(opts.routeOrder, conf.route_order);
+	opts.timeoutMs = resolveSeconds(opts.timeout, conf.timeout, REQUEST_TIMEOUT_MS, 'timeout');
+	opts.budgetMs = resolveSeconds(opts.budget, conf.budget, REQUEST_BUDGET_MS, 'budget');
+	opts.probe = resolveProbe(opts.probe, conf.probe);
 	if (!opts.host || !opts.key) {
 		console.error('router-relay: need an upstream host and api key (conf.txt or --host/--key)');
 		process.exit(2);
 	}
-	opts.routes = buildRoutes(opts);
-	// Passthrough is fetch-only, so it cannot work for a proxy-only route set. Say it once at
-	// startup instead of leaving the operator to wonder why "stream=on" still looks buffered.
-	if (opts.streamMode !== 'off' && opts.routes.every((route) => !canStreamThrough(route))) {
-		announce('router-relay: stream=' + opts.streamMode + ' but every route uses the proxy transport - streaming will fall back to replay');
+	// A proxy tunnel is only built for https:// upstreams; an http:// base_url with proxy= would
+	// otherwise be sent in the clear, which is never what the operator meant.
+	if (opts.proxy && !/^https:/i.test(opts.host)) {
+		console.error('router-relay: proxy= needs an https:// base_url (got "' + opts.host + '")');
+		process.exit(2);
 	}
+	opts.routes = buildRoutes(opts);
 
 	// An unhandled rejection kills Node (>=15), which is exactly how this relay used to die in the
 	// middle of an answer and make Cline report ECONNRESET. Log and stay alive instead: all state
@@ -920,7 +1255,7 @@ function main() {
 		try {
 			if (req.method === 'POST' && url === '/v1/chat/completions') return run(opts, res, handleChat(opts, req, res));
 			if (req.method === 'GET' && url === '/v1/models') return run(opts, res, handleModels(opts, res));
-			if (req.method === 'GET' && (url === '/health' || url === '/')) return sendJson(res, 200, { ok: true, port: opts.port, stream: opts.streamMode, upstream: opts.host, upstream_reserved: opts.hostReserved || null, proxy: opts.proxy || null, routes: opts.routes.map(describeRoute), cooling: opts.routeCooldown ? Array.from(opts.routeCooldown.entries()).map(([route, e]) => ({ route, strikes: e.strikes, until: new Date(e.until).toISOString() })) : [], pid: process.pid });
+			if (req.method === 'GET' && (url === '/health' || url === '/')) return sendJson(res, 200, { ok: true, port: opts.port, stream: opts.streamMode, route_order: opts.routeOrder, timeout_ms: opts.timeoutMs, budget_ms: opts.budgetMs, probe: opts.probe, upstream: opts.host, upstream_reserved: opts.hostReserved || null, proxy: opts.proxy || null, routes: opts.routes.map(describeRoute), cooling: opts.routeCooldown ? Array.from(opts.routeCooldown.entries()).map(([route, e]) => ({ route, strikes: e.strikes, until: new Date(e.until).toISOString() })) : [], pid: process.pid });
 			return failSafely(opts, res, 404, { error: { message: 'relay: unknown route ' + req.method + ' ' + url, type: 'invalid_request_error' } });
 		} catch (err) {
 			log(opts, 'routing failed:', err && err.message ? err.message : String(err));
@@ -952,7 +1287,8 @@ function main() {
 			if (opts.port !== address.port) log(opts, 'port 0 requested, OS assigned', address.port);
 			opts.port = address.port;
 		}
-		announce('router-relay listening on http://127.0.0.1:' + opts.port + '/v1  ->  ' + opts.routes.map(describeRoute).join('  ||  ') + ' (pid ' + process.pid + ', stream=' + opts.streamMode + ', failover order: ' + opts.routes.length + ' routes x ' + ROUTE_PASSES + ' passes; streaming clients get SSE, non-streaming clients get JSON)');
+		announce('router-relay listening on http://127.0.0.1:' + opts.port + '/v1  ->  ' + opts.routes.map(describeRoute).join('  ||  ') + ' (pid ' + process.pid + ', stream=' + opts.streamMode + ', order=' + opts.routeOrder + ', timeout=' + Math.round(opts.timeoutMs / 1000) + 's, budget=' + Math.round(opts.budgetMs / 1000) + 's, probe=' + (opts.probe ? 'on' : 'off') + ', failover order: ' + opts.routes.length + ' routes x ' + ROUTE_PASSES + ' passes; streaming clients get SSE, non-streaming clients get JSON)');
+		startRouteProbe(opts);
 	});
 }
 

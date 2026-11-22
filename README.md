@@ -2,12 +2,14 @@
 
 **English** | [Русский](README.ru.md)
 
-A local, dependency-free, OpenAI-compatible (`/v1`) relay that makes a router which
-cannot terminate an SSE stream usable from streaming clients such as the Cline CLI and
-the Hermes agent.
+A local, dependency-free, OpenAI-compatible (`/v1`) relay that makes a cheap router usable
+from streaming clients such as the Cline CLI and the Hermes agent: it repairs broken SSE
+streams, fails over between the direct path and a local proxy, and keeps every turn inside
+the client's timeout.
 
 ```
-client ──SSE──▶ 127.0.0.1:8765 ──JSON (stream:false)──▶ router ──JSON──▶ relay ──valid SSE──▶ client
+client ──SSE──▶ 127.0.0.1:8765 ──stream:false (replay) or SSE (passthrough)──▶ router
+                               ◀── JSON or SSE ── relay ── valid SSE ── client
 ```
 
 ## Why this exists
@@ -50,11 +52,10 @@ call because it is meaningless without streaming.
 
 ## Requirements
 
-- **Node.js 18 or newer** — the relay uses global `fetch`, `AbortSignal.timeout` and the
-  `node:` module prefix. There are no npm dependencies.
-- **`curl.exe`** — only when `proxy=` is configured, because Node's own `fetch` genuinely
-  ignores `HTTP_PROXY`/`HTTPS_PROXY` and curl is used to build the tunnel. Already
-  present on Windows 10 1803+ and most Linux distributions.
+- **Node.js 18 or newer** — the relay uses the `node:` module prefix, keep-alive agents and
+  `AbortSignal`. There are no npm dependencies.
+- **No external tools.** The proxy tunnel is built with Node's own `CONNECT` support, so
+  `curl` is not needed (it was, in earlier versions).
 - Windows PowerShell 5.1+ or PowerShell 7+ for the optional launchers.
 
 ## Quick start
@@ -96,9 +97,13 @@ Blank lines and lines starting with `#` or `;` are ignored.
 | `base_url_reserved` | Spare hostname, used as an extra failover route. |
 | `api_key` | Bearer token sent upstream. |
 | `model` | Read by `Start-Cline.ps1` to build the isolated profile. The relay itself takes the model from the request unless `--model` is passed. |
-| `proxy` | Optional local HTTP proxy (e.g. `http://127.0.0.1:10809`). Empty = direct. |
+| `proxy` | Optional local HTTP proxy (e.g. `http://127.0.0.1:10809`). Empty = direct. The tunnel is built with `CONNECT` by the relay itself, so proxied requests stream exactly like direct ones. Requires an `https://` `base_url`. |
 | `port` | TCP port on `127.0.0.1`. Empty or absent = `8765`. `0` lets the OS pick a free port (printed at startup and reported by `/health`); any other number runs several relays side by side. **`--port` overrides this.** |
 | `stream` | `off` (default), `on` or `auto` — see [Streaming](#streaming). **`--stream` overrides this.** |
+| `route_order` | `direct-first` (default) or `proxy-first` — which path is tried first. **`--route-order` overrides this.** |
+| `timeout` | Seconds one upstream attempt may take. Default `120`. **`--timeout` overrides this.** |
+| `budget` | Seconds the whole request may take, across every route and both passes. Default `240`. **`--budget` overrides this.** |
+| `probe` | `on` (default) or `off` — re-probe cooling routes in the background. **`--probe` overrides this.** |
 
 > **`conf.txt` is git-ignored.** Only `conf.example.txt` is committed. See
 > [Security](#security).
@@ -118,11 +123,13 @@ Two invariants hold in every mode:
 
 - A client that does **not** set `"stream": true` always gets one JSON object, never SSE. Hermes's
   auxiliary calls (approvals, titles, compression) depend on this.
-- Passthrough needs `fetch`, so it is only available on direct routes. A route that goes through
-  the proxy (curl) is buffered regardless of `stream=`, and the relay says so at startup.
+- Passthrough works on direct **and** proxied routes: the transport is Node's own HTTP client,
+  which builds a `CONNECT` tunnel for `proxy=`. The old curl transport buffered every body, which
+  is why proxied traffic used to be replayed regardless of `stream=`.
 
 Failover is identical in both modes: a bad status or a failed connection is retried on the next
-route *before* anything reaches the client, because `fetch` resolves on the response headers.
+route *before* anything reaches the client, because the response headers are known before the
+first body byte is forwarded.
 
 ## Endpoints
 
@@ -130,7 +137,7 @@ route *before* anything reaches the client, because `fetch` resolves on the resp
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Translated to the upstream router; SSE or JSON as described above. |
 | `GET` | `/v1/models` | Passed through to the upstream router (30 s timeout). |
-| `GET` | `/health`, `/` | Local liveness check. Returns `ok`, `port`, `stream`, `upstream`, `upstream_reserved`, `proxy`, `routes`, `cooling` and `pid`. |
+| `GET` | `/health`, `/` | Local liveness check. Returns `ok`, `port`, `stream`, `route_order`, `timeout_ms`, `budget_ms`, `probe`, `upstream`, `upstream_reserved`, `proxy`, `routes`, `cooling` and `pid`. |
 
 `/health` is what the launchers poll before starting a client, so it must answer even
 while every upstream route is down.
@@ -139,7 +146,9 @@ while every upstream route is down.
 
 ```
 node router-relay.js [--port 8765] [--stream off|on|auto] [--host URL] [--host-reserved URL]
-                     [--key KEY] [--model ID] [--conf path] [--proxy URL] [--log FILE] [-v]
+                     [--key KEY] [--model ID] [--conf path] [--proxy URL] [--log FILE]
+                     [--route-order direct-first|proxy-first] [--timeout SEC] [--budget SEC]
+                     [--probe on|off] [-v]
 ```
 
 | Flag | Alias | Default | Meaning |
@@ -152,12 +161,18 @@ node router-relay.js [--port 8765] [--stream off|on|auto] [--host URL] [--host-r
 | `--model` | `-m` | request model | Pin the model, ignoring what the client sends. |
 | `--conf` | | `<script dir>\conf.txt` | Alternative config file. |
 | `--proxy` | | `conf.txt` `proxy` | Override the proxy URL. |
+| `--route-order` | `-r` | `conf.txt` `route_order`, else `direct-first` | Which path is tried first. |
+| `--timeout` | `-t` | `conf.txt` `timeout`, else `120` | Seconds per upstream attempt. |
+| `--budget` | | `conf.txt` `budget`, else `240` | Seconds for the whole request. |
+| `--probe` | | `conf.txt` `probe`, else `on` | Background re-probing of cooling routes. |
 | `--log` | | none | Append diagnostics to a file. |
 | `--verbose` | `-v` | off | Also echo diagnostics to the console. |
 | `--help` | `-h` | | Print the header comment of the script. |
 
 The relay refuses to start without a host and a key (exit code `2`), exits with code `2` on an
-invalid `--port` or `--stream` value, and exits with code `3` if the port is already in use.
+invalid `--port`, `--stream`, `--route-order`, `--timeout`, `--budget` or `--probe` value, on a
+`proxy=` combined with a non-`https://` `base_url`, and exits with code `3` if the port is
+already in use.
 
 Running several relays side by side:
 
@@ -187,7 +202,9 @@ Direct comes first because it is the fastest path (~80 ms of TLS against ~300 ms
 the proxy) and it does not depend on the proxy being up. The proxy follows immediately
 because when Cloudflare blocks a region every direct host fails together — both hostnames
 are the same zone. The reserved host is still walked, for the case where a single
-hostname is in trouble rather than the whole zone.
+hostname is in trouble rather than the whole zone. `route_order=proxy-first` reverses that
+within each host, for a machine where the direct path is blocked: there every direct attempt
+costs 10–20 s before the tunnel is even tried.
 
 The whole list is walked **twice** (`ROUTE_PASSES = 2`), because the router also flakes
 on its own independently of the route.
@@ -203,16 +220,30 @@ Cloudflare-reset connection can take ~19 s to surface, and re-paying that on eve
 would be worse than the outage it guards against. A route that fails is therefore put in
 the corner — `60 s`, doubling per consecutive failure, capped at `15 min` — and healthy
 routes are tried first. A cooling route is never dropped: if the healthy ones also fail,
-the cooling ones are still walked. Strikes are cleared on success, so a recovered direct
-path comes back on its own.
+the cooling ones are still walked. Strikes are cleared on success. A cooling route is also
+**re-probed in the background** (`probe=on`, every 5 minutes), so a recovered path comes back
+without a user request paying for the discovery.
+
+**Timeouts that add up.** `timeout` (default 120 s) caps one attempt and `budget`
+(default 240 s) caps the whole request across every route and both passes. Without the
+budget, 4 routes × 2 passes × 10 minutes meant a single turn could hang for 80 minutes while
+the client had given up after five — and the router kept billing for answers nobody read.
+Keep `budget` below the client's own timeout (Cline uses 300 s).
+
+**Client identity.** The router only serves traffic it recognises as a mainstream coding CLI,
+so the client's `User-Agent` is forwarded upstream. A router that answers `200` with a policy
+notice instead of a completion is reported as a `502` error rather than replayed as an
+assistant message, so the client does not present it as the model's answer.
+
+**Client disconnects.** When the client hangs up, the upstream request is aborted instead of
+being finished into the void. A disconnect does not put the route into cooldown — the route
+is fine, the caller simply left.
 
 **Process-level guards.** `unhandledRejection` and `uncaughtException` are logged instead
 of killing the process (Node ≥ 15 would otherwise exit mid-answer, which is exactly how
 this used to surface as `ECONNRESET` in Cline). Client sockets that vanish are tolerated,
 every request path is wrapped, and a `200` without `choices` is surfaced as a proper
 `502` instead of being replayed as an empty answer.
-
-Per-attempt timeout is 10 minutes, because reasoning models can think for a long time.
 
 ## Launchers (Windows)
 
