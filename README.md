@@ -232,8 +232,11 @@ Keep `budget` below the client's own timeout (Cline uses 300 s).
 
 **Client identity.** The router only serves traffic it recognises as a mainstream coding CLI,
 so the client's `User-Agent` is forwarded upstream. A router that answers `200` with a policy
-notice instead of a completion is reported as a `502` error rather than replayed as an
-assistant message, so the client does not present it as the model's answer.
+notice instead of a completion is reported as a short `502` error rather than replayed as an
+assistant message, so the client does not present it as the model's answer. The notice's own
+text is never reproduced — not in the response and not in the log — because it tells the reader
+nothing they can act on. In passthrough mode the first few bytes are held back until the answer
+actually starts, which is what makes the same check possible before the `200` is committed.
 
 **Client disconnects.** When the client hangs up, the upstream request is aborted instead of
 being finished into the void. A disconnect does not put the route into cooldown — the route

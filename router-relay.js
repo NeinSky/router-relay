@@ -84,8 +84,8 @@
  *
  *   Client identity. The router only serves traffic it recognises as a mainstream coding CLI, so
  *   the client's User-Agent is forwarded upstream. A router that answers 200 with a policy notice
- *   instead of a completion ("本站仅限主流 Coding 客户端/CLI 使用...") is reported as a 502 error rather
- *   than replayed as an assistant message.
+ *   instead of a completion is reported as a short 502 error rather than replayed as an assistant
+ *   message; the notice's own text is never reproduced in the response or the log.
  */
 
 'use strict';
@@ -309,6 +309,9 @@ function readBody(req) {
 // rejected at startup instead of being silently sent in the clear.
 const agents = new Map();
 const directAgent = new https.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
+// A plain agent for an http:// upstream (a local test server, a self-hosted gateway). Using the
+// https.Agent there fails with ERR_INVALID_PROTOCOL, which used to look like a route failure.
+const plainAgent = new http.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
 
 // An https.Agent whose sockets are opened with the proxy's CONNECT method and then wrapped in TLS.
 // Keep-alive lives in the base class, so one tunnel is reused across turns exactly like a direct
@@ -379,14 +382,16 @@ class ProxyAgent extends https.Agent {
 	}
 }
 
-function agentFor(route) {
-	if (!route.proxy) return directAgent;
-	let agent = agents.get(route.proxy);
-	if (!agent) {
-		agent = new ProxyAgent(route.proxy);
-		agents.set(route.proxy, agent);
+function agentFor(route, secure) {
+	if (route.proxy) {
+		let agent = agents.get(route.proxy);
+		if (!agent) {
+			agent = new ProxyAgent(route.proxy);
+			agents.set(route.proxy, agent);
+		}
+		return agent;
 	}
-	return agent;
+	return secure ? directAgent : plainAgent;
 }
 
 // One request on one route, buffered or streaming. The streaming variant resolves as soon as the
@@ -415,7 +420,7 @@ function requestOverHttp(opts, route, pathname, options) {
 			path: url.pathname + (url.search || ''),
 			method: options.method || (options.stream ? 'POST' : 'GET'),
 			headers,
-			agent: agentFor(route),
+			agent: agentFor(route, secure),
 		});
 
 		const timeoutMs = options.timeoutMs || REQUEST_TIMEOUT_MS;
@@ -888,16 +893,31 @@ function pipeStreamToClient(opts, res, upstream, model) {
 		let tail = '';
 		let terminated = false;
 		let bytes = 0;
-
-		res.writeHead(200, {
-			'content-type': 'text/event-stream',
-			'cache-control': 'no-cache, no-transform',
-			connection: 'keep-alive',
-			'x-accel-buffering': 'no',
-		});
-		if (typeof res.flushHeaders === 'function') res.flushHeaders();
+		// The head is held back until the answer actually starts, so a policy notice can still be
+		// turned into an error: once a 200 and its headers are out, nothing can be taken back.
+		let head = '';
+		let started = false;
 
 		const source = nodeStream(upstream.body);
+
+		const startResponse = () => {
+			if (started) return;
+			started = true;
+			res.writeHead(200, {
+				'content-type': 'text/event-stream',
+				'cache-control': 'no-cache, no-transform',
+				connection: 'keep-alive',
+				'x-accel-buffering': 'no',
+			});
+			if (typeof res.flushHeaders === 'function') res.flushHeaders();
+			if (head) {
+				try {
+					res.write(head);
+				} catch (err) {
+					log(opts, 'write to client failed:', err && err.message ? err.message : String(err));
+				}
+			}
+		};
 
 		// The client hanging up must also stop reading from the upstream: otherwise the tunnel
 		// stays open and the router keeps generating (and billing) tokens nobody will see.
@@ -915,6 +935,19 @@ function pipeStreamToClient(opts, res, upstream, model) {
 			// Only the tail is decoded: `[DONE]` is always the last event, and decoding the whole
 			// answer just to look for it would defeat the point of streaming.
 			tail = (tail + buf.toString('utf8')).slice(-PASSTHROUGH_TAIL_CHARS);
+
+			if (!started) {
+				head += buf.toString('utf8');
+				if (isPolicyBlock(head)) {
+					source.destroy();
+					resolve({ terminated: false, bytes, started: false, policyBlock: true });
+					return;
+				}
+				if (!headHasAnswer(head) && head.length < POLICY_HEAD_MAX) return;
+				startResponse();
+				return;
+			}
+
 			if (res.writableEnded || res.destroyed) return;
 			try {
 				res.write(buf);
@@ -925,6 +958,10 @@ function pipeStreamToClient(opts, res, upstream, model) {
 
 		source.on('error', (err) => {
 			log(opts, 'stream source error:', err && err.message ? err.message : String(err));
+			if (!started) {
+				resolve({ terminated: false, bytes, started: false });
+				return;
+			}
 			if (!res.writableEnded && !res.destroyed) {
 				try {
 					res.end();
@@ -932,11 +969,20 @@ function pipeStreamToClient(opts, res, upstream, model) {
 					/* the client is gone */
 				}
 			}
-			resolve({ terminated: false, bytes });
+			resolve({ terminated: false, bytes, started: true });
 		});
 
 		source.on('end', () => {
 			terminated = tail.includes('[DONE]');
+			// A stream that ended before a single delta arrived still has to be closed properly -
+			// unless its content was the policy notice, which the caller turns into an error.
+			if (!started) {
+				if (isPolicyBlock(tail)) {
+					resolve({ terminated: false, bytes, started: false, policyBlock: true });
+					return;
+				}
+				startResponse();
+			}
 			const body = Buffer.concat(chunks).toString('utf8');
 			const finish = /"finish_reason"\s*:\s*"([^"]+)"/.exec(body);
 			log(opts, 'upstream stream done', {
@@ -952,7 +998,7 @@ function pipeStreamToClient(opts, res, upstream, model) {
 					log(opts, 'failed to close stream:', err && err.message ? err.message : String(err));
 				}
 			}
-			resolve({ terminated, bytes });
+			resolve({ terminated, bytes, started: true });
 		});
 	});
 }
@@ -985,17 +1031,57 @@ function replayAsJson(opts, res, upstream, model) {
 	}
 }
 
-// Some routers answer a blocked request with 200 and a policy notice in `content` instead of a
-// completion (the message this project was debugged against is
-// "本站仅限主流 Coding 客户端/CLI 使用...当前客户端不支持"). Replaying that as an assistant message makes
-// the client believe the model said it, so it is surfaced as an error instead.
-const POLICY_BLOCK_MARKERS = ['本站仅限', '当前客户端不支持'];
+// Some routers answer a request they do not want with 200 and a policy notice in `content`
+// instead of a completion: the notice this project was debugged against says, in Chinese, that the
+// site only serves mainstream coding clients and that the current one is not supported. Replaying
+// it makes the client believe the model said it, and the text itself is of no use to whoever reads
+// the answer. So it is detected and turned into a short error - the notice is never reproduced,
+// neither in the response nor in the log.
+//
+// The markers are written as escapes on purpose: the source stays ASCII, and nobody has to read
+// the notice in the code.
+const POLICY_BLOCK_MARKERS = ['\u672c\u7ad9\u4ec5\u9650', '\u5f53\u524d\u5ba2\u6237\u7aef\u4e0d\u652f\u6301'];
+const POLICY_BLOCK_MESSAGE =
+	'the router refused this request: it only accepts clients it recognises as a mainstream coding ' +
+	'CLI, so it answered with a notice instead of a completion. Retry from a supported client or ' +
+	'check the account plan.';
+// How much of a passthrough stream is held back while waiting for the answer to start. The notice
+// arrives as the first content delta, so this is only a safety valve for a stream that never does.
+const POLICY_HEAD_MAX = 8192;
 
-function findPolicyBlock(json) {
-	const message = json && Array.isArray(json.choices) && json.choices[0] ? json.choices[0].message : null;
-	const content = message && typeof message.content === 'string' ? message.content : '';
-	if (!content) return null;
-	return POLICY_BLOCK_MARKERS.some((marker) => content.includes(marker)) ? content.trim() : null;
+function isPolicyBlock(text) {
+	if (typeof text !== 'string' || text.length === 0) return false;
+	return POLICY_BLOCK_MARKERS.some((marker) => text.includes(marker));
+}
+
+// Reads the `content` of a complete chat completion, or '' when there is none.
+function completionText(json) {
+	const choice = json && Array.isArray(json.choices) ? json.choices[0] : null;
+	const message = choice ? choice.message : null;
+	return message && typeof message.content === 'string' ? message.content : '';
+}
+
+// True once the buffered SSE head holds a delta the client would actually see. Role-only,
+// usage-only and `[DONE]` events do not count: the answer has not started yet, so the head can
+// still be held back without the client noticing a delay.
+function headHasAnswer(head) {
+	for (const line of head.split('\n')) {
+		if (!line.startsWith('data: ')) continue;
+		const raw = line.slice(6).trim();
+		if (!raw || raw === '[DONE]') continue;
+		let parsed;
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			continue; // a chunk boundary split this line; the next chunk completes it
+		}
+		const choice = parsed && Array.isArray(parsed.choices) ? parsed.choices[0] : null;
+		const delta = choice ? choice.delta : null;
+		if (!delta) continue;
+		if (typeof delta.content === 'string' && delta.content.length > 0) return true;
+		if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0) return true;
+	}
+	return false;
 }
 
 async function handleChat(opts, req, res) {
@@ -1088,6 +1174,18 @@ async function handleChat(opts, req, res) {
 				}
 
 				const result = await pipeStreamToClient(opts, res, streamed, model);
+				if (result.policyBlock) {
+					log(opts, 'upstream refused the request (policy gate: unsupported client), streamed a notice instead of a completion');
+					failSafely(opts, res, 502, { error: { message: 'relay: ' + POLICY_BLOCK_MESSAGE, type: 'api_error' } });
+					return;
+				}
+				if (!result.started) {
+					// The stream died before the answer began and nothing reached the client, so a
+					// clean error is still possible instead of an empty 200.
+					log(opts, 'stream ended before the answer started');
+					failSafely(opts, res, 502, { error: { message: 'relay: the upstream stream ended before the answer started', type: 'api_error' } });
+					return;
+				}
 				if (opts.streamMode === 'auto' && !result.terminated) {
 					// Remember the verdict per route so the next request does not pay for the same
 					// discovery: this upstream does not terminate streams, buffer it from now on.
@@ -1136,10 +1234,9 @@ async function handleChat(opts, req, res) {
 			return;
 		}
 
-		const blocked = findPolicyBlock(json);
-		if (blocked) {
-			log(opts, 'upstream refused the request (policy gate):', blocked.slice(0, 200));
-			failSafely(opts, res, 502, { error: { message: 'router refused this request: ' + blocked, type: 'api_error' } });
+		if (isPolicyBlock(completionText(json))) {
+			log(opts, 'upstream refused the request (policy gate: unsupported client), answered with a notice instead of a completion');
+			failSafely(opts, res, 502, { error: { message: 'relay: ' + POLICY_BLOCK_MESSAGE, type: 'api_error' } });
 			return;
 		}
 
