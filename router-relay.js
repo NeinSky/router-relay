@@ -132,6 +132,16 @@ const ROUTE_COOLDOWN_MAX_MS = 900000;
 // a recovered route only returned when its cooldown happened to expire in the middle of a turn,
 // and the "strike" counters grew forever (they reached 189/75 on a ten-day-old process).
 const ROUTE_PROBE_MS = 300000;
+// How long a route that was caught dropping a passthrough stream stays buffered. The verdict comes
+// from a single answer, and the upstream can be fixed or can have had a bad minute, so it must
+// expire. It also never removes the route from the failover pool: it only says "ask this one for a
+// complete answer". A permanent verdict that also dropped the route is what once left nothing but
+// the blocked direct path in the pool, after which every request died with ECONNRESET.
+const PASSTHROUGH_BROKEN_MS = ROUTE_COOLDOWN_MAX_MS;
+// Budget for the replay attempt that follows a failed passthrough. The response has already been
+// held back and the client is still waiting, so this is a rescue with what is left of the turn,
+// not a second full failover walk.
+const REPLAY_FALLBACK_BUDGET_MS = 60000;
 
 // How the route list is ordered. "direct-first" is faster and needs no proxy; "proxy-first" is for
 // a machine where the direct path is blocked (Cloudflare challenge, ISP filter, region block) -
@@ -435,6 +445,19 @@ function requestOverHttp(opts, route, pathname, options) {
 		req.setTimeout(timeoutMs, () => req.destroy(timeoutError()));
 		req.on('error', (err) => {
 			stopDeadline();
+			// A keep-alive socket the edge closed while it sat idle fails the *next* request with
+			// ECONNRESET before a single response byte arrives, and Node does not retry it - so a
+			// healthy route looks dead for one attempt. The connection worked a moment ago, so a
+			// retry on a fresh socket is safe. Only a reused socket qualifies: on a fresh one the
+			// reset is real and retrying would just repeat it.
+			if (!settled && req.reusedSocket && err && err.code === 'ECONNRESET' && !options.staleSocketRetried) {
+				log(opts, 'stale keep-alive socket reset, retrying once on a fresh socket:', describeRoute(route));
+				settle(resolve, requestOverHttp(opts, route, pathname, { ...options, staleSocketRetried: true }));
+				return;
+			}
+			// Carry the route on the error: without it the client only ever saw "relay: read
+			// ECONNRESET", which reads like a fault in the relay instead of a reset on one path.
+			if (err && typeof err === 'object' && !err.route) err.route = describeRoute(route);
 			settle(reject, err);
 		});
 
@@ -565,6 +588,30 @@ function coolDownRoute(opts, route) {
 function clearCooldown(opts, route) {
 	if (opts.routeCooldown) opts.routeCooldown.delete(describeRoute(route));
 }
+
+// Routes that were caught dropping a passthrough stream, each with the moment its verdict expires.
+// The entry is a hint for the passthrough attempt, not a health verdict: requestUpstream still
+// walks the route, it just asks it for a complete answer.
+function markPassthroughBroken(opts, route) {
+	if (!route) return;
+	opts.passthroughBroken = opts.passthroughBroken || new Map();
+	opts.passthroughBroken.set(route, Date.now() + PASSTHROUGH_BROKEN_MS);
+}
+
+function clearPassthroughBroken(opts, route) {
+	if (opts.passthroughBroken) opts.passthroughBroken.delete(route);
+}
+
+// Expiry is checked on read, so a stale verdict disappears without a timer and /health never
+// reports a route that has already been forgiven.
+function isPassthroughBroken(opts, route) {
+	if (!opts.passthroughBroken) return false;
+	const until = opts.passthroughBroken.get(route);
+	if (until === undefined) return false;
+	if (until > Date.now()) return true;
+	opts.passthroughBroken.delete(route);
+	return false;
+}
 // Transports hide the useful half of a failure in `cause`; the old log only ever said "fetch
 // failed", which is why a permanently blocked direct route looked like an unexplained mystery.
 function describeError(err) {
@@ -577,6 +624,12 @@ function describeError(err) {
 		cause = cause.cause;
 	}
 	return text;
+}
+
+// One line for the client, carrying the two facts needed to act on it: what failed and where.
+function describeFailure(err) {
+	const message = err && err.message ? err.message : String(err);
+	return err && err.route ? message + ' on ' + err.route : message;
 }
 
 // How long the next attempt may take: never longer than one attempt, never past the request
@@ -652,12 +705,15 @@ async function requestUpstream(opts, pathname, options) {
 // response, so a later failure can still be answered with a clean JSON error.
 async function requestUpstreamStream(opts, pathname, options) {
 	let routes = routeOrder(opts);
-	// In auto mode a route that was already caught dropping the stream is skipped for passthrough;
-	// if that leaves nothing, the request simply falls back to the replay path.
+	// In auto mode a route that was caught dropping the stream is asked for a complete answer
+	// instead. The route stays in the failover list on purpose: dropping it from the pool is what
+	// once left nothing but a blocked direct path, so every request failed with ECONNRESET while a
+	// perfectly good proxy route sat unused. If every route is in that state, this request simply
+	// takes the replay path - the caller sees streamUnsupported and falls back.
 	if (opts.streamMode === 'auto' && opts.passthroughBroken && opts.passthroughBroken.size > 0) {
-		const usable = routes.filter((route) => !opts.passthroughBroken.has(describeRoute(route)));
+		const usable = routes.filter((route) => !isPassthroughBroken(opts, describeRoute(route)));
 		if (usable.length === 0) {
-			const err = new Error('every route is known to drop streams; use stream=off');
+			const err = new Error('every route is currently buffered - the replay path answers this one');
 			err.streamUnsupported = true;
 			throw err;
 		}
@@ -1159,9 +1215,48 @@ async function handleChat(opts, req, res) {
 			if (streamError && streamError.streamUnsupported) {
 				log(opts, 'passthrough unavailable, falling back to replay:', streamError.message);
 			} else if (streamError) {
-				const message = streamError && streamError.message ? streamError.message : String(streamError);
-				log(opts, 'stream upstream failed:', message);
-				failSafely(opts, res, 502, { error: { message: 'relay: ' + message, type: 'api_error' } });
+				// Giving up here is what turned one flaky path into "relay: read ECONNRESET" in the
+				// client: a route that resets a passthrough stream often still answers a plain JSON
+				// request, and the replay path walks the same routes with its own budget.
+				const message = describeFailure(streamError);
+				log(opts, 'stream upstream failed, trying the replay path:', message);
+				let replayed = null;
+				try {
+					replayed = await requestUpstream(opts, '/chat/completions', {
+						method: 'POST',
+						headers: upstreamHeaders,
+						body: bodyText,
+						signal: controller.signal,
+						budgetMs: Math.min(opts.budgetMs || REQUEST_BUDGET_MS, REPLAY_FALLBACK_BUDGET_MS),
+					});
+				} catch (replayErr) {
+					log(opts, 'replay fallback failed too:', describeFailure(replayErr));
+				}
+				let replayedJson = null;
+				if (replayed && replayed.ok) {
+					try {
+						replayedJson = JSON.parse(replayed.text);
+					} catch (err) {
+						log(opts, 'replay fallback body is not JSON:', err && err.message ? err.message : String(err));
+					}
+				}
+				// Nothing usable came back: report the original failure, not the fallback's.
+				if (!replayed || !replayed.ok || !replayedJson || !Array.isArray(replayedJson.choices) || replayedJson.choices.length === 0) {
+					if (replayed && !replayed.ok) {
+						log(opts, 'replay fallback status', replayed.status);
+						mirrorSafely(opts, res, replayed.status, replayed.contentType, replayed.text);
+						return;
+					}
+					failSafely(opts, res, 502, { error: { message: 'relay: ' + message, type: 'api_error' } });
+					return;
+				}
+				if (isPolicyBlock(completionText(replayedJson))) {
+					log(opts, 'upstream refused the request (policy gate: unsupported client), answered with a notice instead of a completion');
+					failSafely(opts, res, 502, { error: { message: 'relay: ' + POLICY_BLOCK_MESSAGE, type: 'api_error' } });
+					return;
+				}
+				log(opts, 'upstream ok', { ms: Date.now() - started, finish: replayedJson.choices[0].finish_reason, mode: 'sse', route: replayed.route || null, transport: 'replay-fallback' });
+				replayAsStream(opts, res, replayedJson, model);
 				return;
 			} else {
 				if (!streamed.ok) {
@@ -1189,9 +1284,14 @@ async function handleChat(opts, req, res) {
 				if (opts.streamMode === 'auto' && !result.terminated) {
 					// Remember the verdict per route so the next request does not pay for the same
 					// discovery: this upstream does not terminate streams, buffer it from now on.
-					opts.passthroughBroken = opts.passthroughBroken || new Set();
-					opts.passthroughBroken.add(streamed.route);
+					// The verdict is a hint with an expiry - the route stays in the failover pool.
+					markPassthroughBroken(opts, streamed.route);
 					log(opts, 'passthrough did not terminate - buffering this route from now on:', streamed.route);
+				}
+				if (result.terminated) {
+					// A terminated stream proves the route can do passthrough, so an older verdict
+					// is stale and must not keep costing latency on this route.
+					clearPassthroughBroken(opts, streamed.route);
 				}
 				return;
 			}
@@ -1352,7 +1452,7 @@ function main() {
 		try {
 			if (req.method === 'POST' && url === '/v1/chat/completions') return run(opts, res, handleChat(opts, req, res));
 			if (req.method === 'GET' && url === '/v1/models') return run(opts, res, handleModels(opts, res));
-			if (req.method === 'GET' && (url === '/health' || url === '/')) return sendJson(res, 200, { ok: true, port: opts.port, stream: opts.streamMode, route_order: opts.routeOrder, timeout_ms: opts.timeoutMs, budget_ms: opts.budgetMs, probe: opts.probe, upstream: opts.host, upstream_reserved: opts.hostReserved || null, proxy: opts.proxy || null, routes: opts.routes.map(describeRoute), cooling: opts.routeCooldown ? Array.from(opts.routeCooldown.entries()).map(([route, e]) => ({ route, strikes: e.strikes, until: new Date(e.until).toISOString() })) : [], pid: process.pid });
+			if (req.method === 'GET' && (url === '/health' || url === '/')) return sendJson(res, 200, { ok: true, port: opts.port, stream: opts.streamMode, route_order: opts.routeOrder, timeout_ms: opts.timeoutMs, budget_ms: opts.budgetMs, probe: opts.probe, upstream: opts.host, upstream_reserved: opts.hostReserved || null, proxy: opts.proxy || null, routes: opts.routes.map(describeRoute), cooling: opts.routeCooldown ? Array.from(opts.routeCooldown.entries()).map(([route, e]) => ({ route, strikes: e.strikes, until: new Date(e.until).toISOString() })) : [], passthrough_broken: (opts.passthroughBroken ? opts.routes.map(describeRoute).filter((route) => isPassthroughBroken(opts, route)) : []), pid: process.pid });
 			return failSafely(opts, res, 404, { error: { message: 'relay: unknown route ' + req.method + ' ' + url, type: 'invalid_request_error' } });
 		} catch (err) {
 			log(opts, 'routing failed:', err && err.message ? err.message : String(err));

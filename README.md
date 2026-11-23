@@ -117,7 +117,7 @@ Which one is right depends on the upstream, so it is a setting rather than a gue
 |---|---|---|
 | `off` | Asks the upstream for `"stream": false`, reads the complete JSON answer, then replays it as a valid SSE stream (role delta, content deltas, tool-call deltas, `finish_reason`, `[DONE]`). | **Default.** The upstream never terminates its stream — the case this relay was written for. |
 | `on` | Passes the upstream SSE bytes through untouched: real incremental output, lower latency, no re-serialisation. | The upstream terminates properly (`finish_reason` + `[DONE]`). Selectel AI Gateway does. |
-| `auto` | Tries the passthrough; if a route's stream ends without `[DONE]`, that route is remembered and buffered from then on. | An upstream whose behaviour you are unsure of. |
+| `auto` | Tries the passthrough; a route caught dropping a stream is asked for a complete answer instead, for the next 15 minutes (the verdict expires, the route is never dropped from the failover list). | An upstream whose behaviour you are unsure of. |
 
 Two invariants hold in every mode:
 
@@ -137,7 +137,7 @@ first body byte is forwarded.
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Translated to the upstream router; SSE or JSON as described above. |
 | `GET` | `/v1/models` | Passed through to the upstream router (30 s timeout). |
-| `GET` | `/health`, `/` | Local liveness check. Returns `ok`, `port`, `stream`, `route_order`, `timeout_ms`, `budget_ms`, `probe`, `upstream`, `upstream_reserved`, `proxy`, `routes`, `cooling` and `pid`. |
+| `GET` | `/health`, `/` | Local liveness check. Returns `ok`, `port`, `stream`, `route_order`, `timeout_ms`, `budget_ms`, `probe`, `upstream`, `upstream_reserved`, `proxy`, `routes`, `cooling`, `passthrough_broken` and `pid`. |
 
 `/health` is what the launchers poll before starting a client, so it must answer even
 while every upstream route is down.
@@ -229,6 +229,22 @@ without a user request paying for the discovery.
 budget, 4 routes × 2 passes × 10 minutes meant a single turn could hang for 80 minutes while
 the client had given up after five — and the router kept billing for answers nobody read.
 Keep `budget` below the client's own timeout (Cline uses 300 s).
+
+**A failed passthrough falls back to replay.** Passthrough is the fast path, not the only
+path. If every route fails at the transport level (a reset, a timeout, a dead tunnel) or a
+route is currently buffered, the relay asks the upstream for a complete JSON answer instead
+and replays it — with its own 60 s budget, because the client is already waiting. A route
+that resets a stream often still answers a plain request, so this is what keeps one flaky path
+from becoming a failed turn. Only when the replay path fails too does the client see an error,
+and it names the route (`relay: read ECONNRESET on https://… direct`) instead of reading like
+a fault inside the relay.
+
+**A buffered route is a hint, not a verdict.** `stream=auto` remembers a route that dropped a
+stream and asks it for a complete answer for the next 15 minutes. That memory expires, and it
+never removes the route from the failover list: a stale, permanent verdict is exactly how a
+single answer once left nothing but a blocked direct path in the pool, after which every
+request died with `ECONNRESET` while a perfectly good proxy route sat unused. A terminated
+stream clears the verdict immediately, and `/health` reports it as `passthrough_broken`.
 
 **Client identity.** The router only serves traffic it recognises as a mainstream coding CLI,
 so the client's `User-Agent` is forwarded upstream. A router that answers `200` with a policy
